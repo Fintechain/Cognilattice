@@ -10,6 +10,7 @@ import json
 import os
 import re
 from dataclasses import dataclass, field
+from datetime import datetime, timezone
 from pathlib import Path
 from typing import ClassVar
 
@@ -123,6 +124,14 @@ class MemeryConfig:
     # MCP
     mcp_tool_prefix: str = "memery_"
 
+    # First-run profile setup. This is intentionally optional: MCP stdio must
+    # never prompt, but clients can detect this state and guide the user.
+    profile_setup_configured: bool = False
+    default_profile_id: str = ""
+    default_personality_id: str = ""
+    default_profession_id: str = ""
+    setup_completed_at: str = ""
+
     # Hall keywords — route content to memory type
     hall_keywords: dict = field(default_factory=lambda: {
         "facts": ["是", "is", "事实", "fact"],
@@ -162,6 +171,16 @@ class MemeryConfig:
             cfg.palace_vector_enabled = os.environ[
                 "MEMERY_PALACE_VECTOR_ENABLED"
             ].lower() in {"1", "true", "yes", "on"}
+        if os.environ.get("MEMERY_DEFAULT_PROFILE_ID"):
+            cfg.default_profile_id = os.environ["MEMERY_DEFAULT_PROFILE_ID"]
+        if os.environ.get("MEMERY_DEFAULT_PERSONALITY_ID"):
+            cfg.default_personality_id = os.environ["MEMERY_DEFAULT_PERSONALITY_ID"]
+        if os.environ.get("MEMERY_DEFAULT_PROFESSION_ID"):
+            cfg.default_profession_id = os.environ["MEMERY_DEFAULT_PROFESSION_ID"]
+        if os.environ.get("MEMERY_PROFILE_SETUP_CONFIGURED"):
+            cfg.profile_setup_configured = os.environ[
+                "MEMERY_PROFILE_SETUP_CONFIGURED"
+            ].lower() in {"1", "true", "yes", "on"}
 
         # File overrides
         if CONFIG_FILE.exists():
@@ -175,6 +194,32 @@ class MemeryConfig:
 
         return cfg
 
+    def setup_required(self) -> bool:
+        """Return true when the user has not chosen a default memory profile."""
+        return not self.default_profile_id
+
+    def mark_profile_setup(
+        self,
+        profile_id: str,
+        personality_id: str | None = None,
+        profession_id: str | None = None,
+        completed_at: str | None = None,
+    ) -> None:
+        """Persist the selected personality/profession default profile."""
+        clean_profile = str(profile_id or "").strip()
+        if not clean_profile:
+            raise ValueError("profile_id cannot be empty")
+        self.default_profile_id = clean_profile
+        if personality_id is not None:
+            self.default_personality_id = str(personality_id or "").strip()
+        if profession_id is not None:
+            self.default_profession_id = str(profession_id or "").strip()
+        self.profile_setup_configured = True
+        self.setup_completed_at = completed_at or datetime.now(
+            timezone.utc
+        ).strftime("%Y-%m-%dT%H:%M:%SZ")
+        self.save()
+
     def save(self) -> None:
         """Persist config to file."""
         CONFIG_DIR.mkdir(parents=True, exist_ok=True)
@@ -187,6 +232,11 @@ class MemeryConfig:
             "palace_vector_enabled": self.palace_vector_enabled,
             "cache_enabled": self.cache_enabled,
             "cache_dir": self.cache_dir,
+            "profile_setup_configured": self.profile_setup_configured,
+            "default_profile_id": self.default_profile_id,
+            "default_personality_id": self.default_personality_id,
+            "default_profession_id": self.default_profession_id,
+            "setup_completed_at": self.setup_completed_at,
         }
         CONFIG_FILE.write_text(json.dumps(data, indent=2, ensure_ascii=False), encoding="utf-8")
 

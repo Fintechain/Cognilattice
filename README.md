@@ -1,11 +1,15 @@
-# Memery
+# Cognilattice / Memery
 
-**A local-first, continuously curated memory layer for AI agents.**
+**A local-first, continuously curated memory lattice for AI agents.**
+
+[中文文档](README.zh-CN.md)
 
 [![License: Apache-2.0](https://img.shields.io/badge/License-Apache--2.0-blue.svg)](LICENSE)
 [![Python 3.10+](https://img.shields.io/badge/Python-3.10%2B-3776AB.svg)](https://www.python.org/)
 [![MCP](https://img.shields.io/badge/Protocol-MCP-6f42c1.svg)](https://modelcontextprotocol.io/)
-[![CI](https://github.com/Fintechain/edge-memery/actions/workflows/ci.yml/badge.svg)](https://github.com/Fintechain/edge-memery/actions/workflows/ci.yml)
+[![CI](https://github.com/Fintechain/Cognilattice/actions/workflows/ci.yml/badge.svg)](https://github.com/Fintechain/Cognilattice/actions/workflows/ci.yml)
+
+**Project description:** Cognilattice is a local-first MCP memory server that turns conversations, decisions, tasks, code structure, professional profiles, summaries, and stress-tested retrieval paths into a durable, searchable context layer for AI agents.
 
 Memery turns conversations, project updates, decisions, tasks, code structure, and general life or business matters into durable context that remains useful across sessions. It is exposed as a Model Context Protocol (MCP) server and runs on the edge: the primary database, vector store, summaries, and knowledge graph remain on the local machine.
 
@@ -80,6 +84,19 @@ score = importance * 0.30
 ```
 
 Strong candidates are accepted automatically. Uncertain candidates remain available for review instead of being silently promoted to durable truth.
+
+### Personality-to-Profession Profiles
+
+Memery can bind a context to a memory profile before ingestion starts. The setup is two-step:
+
+- `personality` defines attention and execution tendency through prompt scaffolding and trait weights.
+- `profession` defines the expert frame: objects, methods, evaluation criteria, focus areas, case memory, and error memory.
+
+The selected personality and profession are composed into one runtime memory profile. This means the practical tendency space is much larger than a single label: the system generates a composed prompt scaffold from the selected personality and profession rather than relying on one static template.
+
+Built-in profiles include `generalist_v1`, `software_engineer_v1`, `research_scientist_v1`, and `clinical_reasoner_v1`, but the setup flow now starts from a wider preset space: 36 personality presets and 72 profession presets. The profession scaffold follows the structure used by occupation resources such as O*NET, SOC, and ESCO: professional identity, objects, methods, evaluation criteria, case memory, and error memory. Profile-aware ingestion stores `base_score`, `store_score`, `memory_layer`, `trait_features`, `profession_features`, and `score_reason` so later curation can explain why a memory was kept. Memories are routed into `semantic`, `episodic`, `procedural`, or `error` layers.
+
+Task feedback can be written with `record_memory_feedback`. Successful memories are lightly reinforced; ineffective or harmful memories are down-weighted, and harmful memories are quarantined for later correction.
 
 ### Self-Maintaining Top-Level Context
 
@@ -159,6 +176,29 @@ Check the installation:
 memery doctor
 ```
 
+Choose the optional default personality/profession profile:
+
+```bash
+memery configure
+```
+
+This foreground setup first asks which personality should guide Memery's
+attention and memory pressure, then asks which profession should guide the
+expert frame. The combination is saved in `~/.memery/config.json`; new
+contexts without an explicit profile inherit it. Trait weights such as rigor,
+exploration, risk sensitivity, abstraction preference, and execution can be
+adjusted after the personality and profession are chosen.
+
+For unattended setup:
+
+```bash
+memery configure --profile software_engineer_v1 --yes
+```
+
+MCP stdio startup never prompts for input. MCP clients should call
+`get_setup_status` and, if needed, guide the user to run `memery configure` or
+call `configure_memory_defaults` with a selected profile id.
+
 For direct source-tree runs before installation:
 
 ```bash
@@ -197,6 +237,10 @@ Install Memery into the same Python environment used by the MCP client. If your 
 
 `memery` and `python -m memory_server` run an MCP stdio server. They are meant to be launched by an MCP client. For a human-readable health check, use `memery doctor`.
 
+Use `memery profiles` to list built-in and custom personality/profession
+profiles, and `memery setup-status` to inspect whether the default profile has
+been configured.
+
 ### Troubleshooting Installation
 
 If `python -m memory_server` reports `No module named memory_server`, install Memery first with `python -m pip install -e .`, or use `python run_server.py` for a direct source-tree run.
@@ -227,6 +271,18 @@ If Windows reports `WinError 32` while reinstalling `memery-mcp`, close any runn
 Supported context types are `auto`, `software`, `research`, `business`, `learning`, and `general`.
 
 ### 2. Ingest an update
+
+To make a context grow toward a professional memory library, bind a profile early:
+
+```json
+{
+  "tool": "set_project_profile",
+  "arguments": {
+    "project_name": "edge-memory-research",
+    "profile_id": "research_scientist_v1"
+  }
+}
+```
 
 ```json
 {
@@ -304,6 +360,7 @@ For repeated individual writes, pass `refresh_summary=false`, then call `refresh
 | Area | Tools |
 |---|---|
 | Context | `create_context`, `create_project`, `wake_up`, `get_top_level_memory`, `get_context_bundle` |
+| Profiles | `get_setup_status`, `configure_memory_defaults`, `list_memory_profiles`, `get_memory_profile`, `create_memory_profile`, `set_project_profile`, `record_memory_feedback`, `list_memory_feedback` |
 | Ingestion | `ingest_update`, `ingest_conversation`, `extract_memory_candidates`, `review_memory_candidate` |
 | Memory | `write_memory`, `write_memories_batch`, `search_memory`, `recall_for_task`, `list_memories` |
 | Curation | `refresh_project_summary`, `update_latest_conversation_summary`, `compact_project_memory`, `prune_low_value_memories` |

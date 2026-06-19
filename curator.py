@@ -14,6 +14,7 @@ Confidence labels: EXTRACTED (from code) / INFERRED (deduced) / AMBIGUOUS (for r
 
 from __future__ import annotations
 
+from collections import Counter
 import json
 import re
 import threading
@@ -21,6 +22,7 @@ from typing import Any
 
 from .config import get_config, Confidence
 from .db import MemoryDB, _uid, _now
+from .profiles import parse_json_object, score_memory_with_profile
 
 # ── Scoring ──────────────────────────────────────────────────────────────
 
@@ -187,10 +189,10 @@ class MemoryCurator:
         accepted = []
         pending = []
         for candidate in candidates:
-            if classify_score(candidate.get("score", 0)) == "accept":
+            if classify_score(candidate.get("store_score", candidate.get("score", 0))) == "accept":
                 accepted.append(self.review_candidate(
                     candidate["id"], "accepted",
-                    reason="Automatically accepted above write threshold.",
+                    reason="Automatically accepted above profile-aware write threshold.",
                     refresh_summary=False,
                 ))
             else:
@@ -222,6 +224,7 @@ class MemoryCurator:
         """Extract candidates using heuristics + mempalace hall detection."""
         segments = re.split(r'(?<=[。！？\.\!\?\n])\s*', text)
         segments = [s.strip() for s in segments if s.strip()]
+        profile = self.db.get_active_profile_for_project(project_id)
 
         candidates = []
         for seg in segments:
@@ -233,7 +236,15 @@ class MemoryCurator:
             final_score = compute_score(**{k: v for k, v in scores.items()
                                           if k in ("importance", "confidence", "novelty",
                                                    "reusability", "actionability")})
-            if classify_score(final_score) == "reject":
+            profile_score = score_memory_with_profile(
+                text=seg,
+                memory_type=candidate_type,
+                base_score=final_score,
+                profile=profile,
+                source_type=source_type,
+            )
+            store_score = profile_score["store_score"]
+            if classify_score(store_score) == "reject":
                 continue
 
             # Route to hall using mempalace
@@ -252,12 +263,22 @@ class MemoryCurator:
                 wing_id=wing_id,
                 hall_id=hall_id,
                 confidence_label=Confidence.INFERRED,
-                reason=f"Heuristic+MemPalace. Hall={hall_id} Score={final_score:.3f}",
+                reason=(
+                    f"Heuristic+Profile+MemPalace. Hall={hall_id} "
+                    f"Base={final_score:.3f} Store={store_score:.3f}"
+                ),
                 importance=scores["importance"],
                 confidence=scores["confidence"],
                 novelty=scores["novelty"],
                 reusability=scores["reusability"],
                 actionability=scores["actionability"],
+                profile_id=profile_score.get("profile_id"),
+                memory_layer=profile_score.get("memory_layer", "semantic"),
+                base_score=profile_score.get("base_score"),
+                store_score=store_score,
+                trait_features=profile_score.get("trait_features"),
+                profession_features=profile_score.get("profession_features"),
+                score_reason=profile_score.get("score_reason", ""),
             )
             candidates.append(candidate)
 
@@ -427,6 +448,13 @@ class MemoryCurator:
                 novelty=candidate.get("novelty", 0),
                 reusability=candidate.get("reusability", 0),
                 actionability=candidate.get("actionability", 0),
+                profile_id=candidate.get("profile_id"),
+                memory_layer=candidate.get("memory_layer", "semantic"),
+                base_score=candidate.get("base_score"),
+                store_score=candidate.get("store_score"),
+                trait_features=candidate.get("trait_features"),
+                profession_features=candidate.get("profession_features"),
+                score_reason=candidate.get("score_reason", ""),
             )
             self.db.update_candidate(candidate_id, status="accepted")
             vector_warning = None
@@ -685,6 +713,22 @@ class MemoryCurator:
 
         if project.get("description"):
             self._append_summary_item(core, project["description"], 8)
+        active_profile = self.db.get_active_profile_for_project(project_id)
+        if active_profile:
+            plan = active_profile.get("development_plan", {})
+            profession = active_profile.get("profession", {})
+            role = plan.get("target_role") or profession.get("role")
+            focus = plan.get("focus_areas", [])
+            if role:
+                self._append_summary_item(
+                    core, f"Memory profile target role: {role}", 8,
+                )
+            if focus:
+                self._append_summary_item(
+                    constraints,
+                    "Memory should preferentially consolidate: " + ", ".join(map(str, focus[:8])),
+                    6,
+                )
 
         for memory in memories:
             if memory.get("memory_type") in CORE_MEMORY_TYPES:
@@ -1002,6 +1046,216 @@ class MemoryCurator:
             pass
         return self.db.get_memory(existing_id) or {}
 
+    def _profile_consolidation(self, project_id: str, memories: list[dict]) -> dict:
+        """Promote repeated profile-shaped experience into expert memory layers."""
+        profile = self.db.get_active_profile_for_project(project_id)
+        if not profile:
+            return {"semantic": 0, "procedural": 0, "error": 0, "promoted_sources": 0}
+
+        profession = profile.get("profession", {})
+        plan = profile.get("development_plan", {})
+        role = plan.get("target_role") or profession.get("role") or "generalist"
+        focus_terms = [str(item) for item in plan.get("focus_areas", [])]
+        object_terms = [str(item) for item in profession.get("objects", [])]
+        method_terms = [str(item) for item in profession.get("methods", [])]
+        evaluation_terms = [str(item) for item in profession.get("evaluation", [])]
+
+        eligible = [
+            memory for memory in memories
+            if memory.get("memory_type") not in TOP_LEVEL_MEMORY_TYPES
+            and memory.get("status", "active") == "active"
+            and memory.get("promotion_state", "raw") not in {"promoted", "quarantined"}
+        ]
+        if not eligible:
+            return {"semantic": 0, "procedural": 0, "error": 0, "promoted_sources": 0}
+
+        term_counts: Counter[str] = Counter()
+        method_counts: Counter[str] = Counter()
+        eval_counts: Counter[str] = Counter()
+        error_memories = []
+        procedural_memories = []
+        source_ids = []
+
+        for memory in eligible:
+            features = parse_json_object(memory.get("profession_features"))
+            source_ids.append(memory["id"])
+            for term in features.get("focus_hits", []):
+                term_counts[str(term)] += 1
+            for term in features.get("object_hits", []):
+                term_counts[str(term)] += 1
+            for term in features.get("method_hits", []):
+                method_counts[str(term)] += 1
+            for term in features.get("evaluation_hits", []):
+                eval_counts[str(term)] += 1
+            if memory.get("memory_layer") == "error" or features.get("error_signal"):
+                error_memories.append(memory)
+            if memory.get("memory_layer") == "procedural" or features.get("procedural_signal"):
+                procedural_memories.append(memory)
+
+        promoted = {"semantic": 0, "procedural": 0, "error": 0, "promoted_sources": 0}
+        top_terms = [
+            term for term, count in term_counts.most_common(8)
+            if count >= 2 or term in focus_terms or term in object_terms
+        ]
+        top_methods = [
+            term for term, count in method_counts.most_common(6)
+            if count >= 1 or term in method_terms
+        ]
+        top_eval = [
+            term for term, count in eval_counts.most_common(6)
+            if count >= 1 or term in evaluation_terms
+        ]
+
+        if top_terms:
+            content = "\n".join([
+                f"# Consolidated professional focus: {role}",
+                "",
+                "Stable objects and focus areas:",
+                *[f"- {term}" for term in top_terms],
+                "",
+                "Evidence basis:",
+                f"- Consolidated from {len(eligible)} active memories.",
+            ])
+            self._upsert_consolidated_memory(
+                project_id=project_id,
+                memory_type="practice_pattern",
+                title=f"{role} consolidated focus",
+                content=content,
+                memory_layer="semantic",
+                profile_id=profile.get("profile_id"),
+                tags=["profile", "consolidated", "semantic"],
+                source_ids=source_ids,
+            )
+            promoted["semantic"] += 1
+
+        if procedural_memories or top_methods:
+            checklist_items = top_methods or [
+                self._compact_text(memory.get("title") or memory.get("content"), 90)
+                for memory in procedural_memories[:6]
+            ]
+            content = "\n".join([
+                f"# Procedural memory for {role}",
+                "",
+                "Reusable method/checklist:",
+                *[f"- {item}" for item in checklist_items if item],
+                "",
+                "Evaluation cues:",
+                *[f"- {item}" for item in top_eval],
+            ]).strip()
+            self._upsert_consolidated_memory(
+                project_id=project_id,
+                memory_type="coding_rule" if "engineer" in str(role) else "principle",
+                title=f"{role} procedural checklist",
+                content=content,
+                memory_layer="procedural",
+                profile_id=profile.get("profile_id"),
+                tags=["profile", "consolidated", "procedural"],
+                source_ids=[memory["id"] for memory in procedural_memories] or source_ids,
+            )
+            promoted["procedural"] += 1
+
+        if error_memories:
+            error_items = [
+                self._compact_text(memory.get("content", ""), 140)
+                for memory in error_memories[:8]
+            ]
+            content = "\n".join([
+                f"# Error library for {role}",
+                "",
+                "Observed failure patterns:",
+                *[f"- {item}" for item in error_items if item],
+                "",
+                "Correction rule:",
+                "- Prefer retrieval of this error layer when a task mentions risk, failure, regression, uncertainty, or safety.",
+            ])
+            self._upsert_consolidated_memory(
+                project_id=project_id,
+                memory_type="error_pattern",
+                title=f"{role} error library",
+                content=content,
+                memory_layer="error",
+                profile_id=profile.get("profile_id"),
+                tags=["profile", "consolidated", "error-library"],
+                source_ids=[memory["id"] for memory in error_memories],
+            )
+            promoted["error"] += 1
+
+        if any(promoted[key] for key in ("semantic", "procedural", "error")):
+            for source_id in source_ids:
+                self.db.update_memory(source_id, promotion_state="promoted")
+            promoted["promoted_sources"] = len(source_ids)
+        return promoted
+
+    def _upsert_consolidated_memory(
+        self,
+        project_id: str,
+        memory_type: str,
+        title: str,
+        content: str,
+        memory_layer: str,
+        profile_id: str | None,
+        tags: list[str],
+        source_ids: list[str],
+    ) -> dict:
+        existing = self.db.search_memories(
+            project_id=project_id,
+            memory_type=memory_type,
+            memory_layer=memory_layer,
+            keyword=title,
+            limit=1,
+        )
+        score_payload = score_memory_with_profile(
+            text=content,
+            memory_type=memory_type,
+            base_score=0.92,
+            profile=self.db.get_memory_profile(profile_id),
+            source_type="consolidation",
+        )
+        if existing:
+            memory = self.db.update_memory(
+                existing[0]["id"],
+                title=title,
+                content=content,
+                tags=json.dumps(tags, ensure_ascii=False),
+                source_files=json.dumps(source_ids, ensure_ascii=False),
+                profile_id=profile_id,
+                memory_layer=memory_layer,
+                importance=0.95,
+                confidence=0.88,
+                novelty=0.6,
+                reusability=0.95,
+                actionability=0.9,
+                base_score=score_payload.get("base_score", 0.92),
+                store_score=score_payload.get("store_score", 0.92),
+                trait_features=score_payload.get("trait_features"),
+                profession_features=score_payload.get("profession_features"),
+                score_reason=score_payload.get("score_reason", ""),
+                promotion_state="consolidated",
+            )
+            return memory or existing[0]
+        return self.db.write_memory(
+            project_id=project_id,
+            memory_type=memory_type,
+            title=title,
+            content=content,
+            hall_id="rules" if memory_layer in {"procedural", "error"} else "general",
+            tags=tags,
+            source_files=source_ids,
+            importance=0.95,
+            confidence=0.88,
+            novelty=0.6,
+            reusability=0.95,
+            actionability=0.9,
+            profile_id=profile_id,
+            memory_layer=memory_layer,
+            base_score=score_payload.get("base_score", 0.92),
+            store_score=score_payload.get("store_score", 0.92),
+            trait_features=score_payload.get("trait_features"),
+            profession_features=score_payload.get("profession_features"),
+            score_reason=score_payload.get("score_reason", ""),
+            promotion_state="consolidated",
+        )
+
     def compact_project_memory(self, project_name: str) -> dict:
         """Compact project memories by merging low-score ones."""
         project = self.db.get_project_by_name(project_name)
@@ -1011,6 +1265,8 @@ class MemoryCurator:
 
         memories = self.db.list_memories(project_id=project_id, limit=500)
         before = len(memories)
+        promotion = self._profile_consolidation(project_id, memories)
+        memories = self.db.list_memories(project_id=project_id, limit=500)
 
         merged = 0
         deprecated = 0
@@ -1041,6 +1297,10 @@ class MemoryCurator:
 
         after = len(self.db.list_memories(project_id=project_id, limit=500))
         summary = f"Compacted {project_name}: {before} → {after} memories"
+        summary = (
+            f"Compacted {project_name}: {before} -> {after} memories; "
+            f"promoted={promotion}"
+        )
         self.db.create_compaction(
             project_id=project_id, scope="all", memories_before=before,
             memories_after=after, removed_count=removed, merged_count=merged,
@@ -1049,6 +1309,7 @@ class MemoryCurator:
         project_summary = self.refresh_project_summary(project_id=project_id)
         return {"memories_before": before, "memories_after": after,
                 "removed": removed, "merged": merged, "deprecated": deprecated,
+                "promoted": promotion,
                 "project_summary": project_summary.get("summary")}
 
     def prune_low_value_memories(self, project_name: str) -> dict:

@@ -45,6 +45,7 @@ from mcp.server.fastmcp import FastMCP
 from .config import get_config, Confidence
 from .db import MemoryDB, _uid, _now
 from .curator import MemoryCurator, PROTECTED_TYPES, TOP_LEVEL_MEMORY_TYPES
+from .profiles import score_memory_with_profile, score_retrieval_with_profile
 from .stdio import run_fastmcp_stdio
 
 logging.getLogger("numexpr").setLevel(logging.WARNING)
@@ -134,34 +135,51 @@ def _safe_refresh_summary(project_id: str) -> tuple[dict | None, str | None]:
 # ═══════════════════════════════════════════════════════════════════════════
 
 @mcp.tool()
-def create_project(name: str, slug: str | None = None,
-                   description: str = "", context_type: str = "auto") -> dict:
+def create_project(
+    name: str,
+    slug: str | None = None,
+    description: str = "",
+    context_type: str = "auto",
+    profile_id: str | None = None,
+) -> dict:
     """Create an isolated context for software or any other ongoing matter."""
     allowed = {"auto", "software", "research", "business", "learning", "general"}
     if context_type not in allowed:
         return {"error": f"context_type must be one of {sorted(allowed)}"}
+    if profile_id and not db.get_memory_profile(profile_id):
+        return {"error": f"Memory profile '{profile_id}' not found."}
     existing = db.get_project_by_name(name)
     if existing:
         return {"warning": f"Project '{name}' already exists.", "project": existing}
-    project = db.create_project(name, slug, description, context_type)
+    project = db.create_project(name, slug, description, context_type, profile_id=profile_id)
     summary = curator.refresh_project_summary(project_id=project["id"])
     return {"status": "created", "project": project,
+            "active_profile": db.get_active_profile_for_project(project["id"]),
             "project_summary": summary.get("summary")}
 
 
 @mcp.tool()
-def create_context(name: str, description: str = "",
-                   context_type: str = "auto") -> dict:
+def create_context(
+    name: str,
+    description: str = "",
+    context_type: str = "auto",
+    profile_id: str | None = None,
+) -> dict:
     """Create a general context: software, research, business, learning, or other."""
     allowed = {"auto", "software", "research", "business", "learning", "general"}
     if context_type not in allowed:
         return {"error": f"context_type must be one of {sorted(allowed)}"}
+    if profile_id and not db.get_memory_profile(profile_id):
+        return {"error": f"Memory profile '{profile_id}' not found."}
     existing = db.get_project_by_name(name)
     if existing:
         return {"warning": f"Context '{name}' already exists.", "context": existing}
-    context = db.create_project(name, description=description, context_type=context_type)
+    context = db.create_project(
+        name, description=description, context_type=context_type, profile_id=profile_id,
+    )
     summary = curator.refresh_project_summary(project_id=context["id"])
     return {"status": "created", "context": context,
+            "active_profile": db.get_active_profile_for_project(context["id"]),
             "top_level_memory": summary}
 
 
@@ -170,6 +188,172 @@ def list_projects() -> dict:
     """List all projects."""
     projects = db.list_projects()
     return {"count": len(projects), "projects": projects}
+
+
+@mcp.tool()
+def list_memory_profiles() -> dict:
+    """List built-in and custom memory profiles."""
+    profiles = db.list_memory_profiles()
+    return {"count": len(profiles), "profiles": profiles}
+
+
+@mcp.tool()
+def list_personality_presets() -> dict:
+    """List the 36 personality presets that shape attention and execution."""
+    presets = db.list_personality_presets()
+    return {"count": len(presets), "personalities": presets}
+
+
+@mcp.tool()
+def list_profession_presets() -> dict:
+    """List the 72 profession presets that shape expert memory scaffolding."""
+    presets = db.list_profession_presets()
+    return {"count": len(presets), "professions": presets}
+
+
+@mcp.tool()
+def get_setup_status() -> dict:
+    """Return first-run personality/profession setup status without prompting."""
+    profile = db.get_memory_profile(cfg.default_profile_id)
+    status = {
+        "configured": bool(cfg.default_profile_id),
+        "setup_required": cfg.setup_required() or profile is None,
+        "default_profile_id": cfg.default_profile_id or None,
+        "default_personality_id": cfg.default_personality_id or None,
+        "default_profession_id": cfg.default_profession_id or None,
+        "setup_completed_at": cfg.setup_completed_at or None,
+        "default_profile": profile,
+        "available_personalities": db.list_personality_presets(),
+        "available_professions": db.list_profession_presets(),
+        "available_profiles": db.list_memory_profiles(),
+        "configure_command": "memery configure",
+    }
+    if cfg.default_profile_id and profile is None:
+        status["warning"] = (
+            f"Configured default profile '{cfg.default_profile_id}' was not found."
+        )
+    return status
+
+
+@mcp.tool()
+def configure_memory_defaults(
+    personality_id: str | None = None,
+    profession_id: str | None = None,
+    profile_id: str | None = None,
+) -> dict:
+    """Set the default memory profile from personality+profession presets.
+
+    Prefer personality_id + profession_id. profile_id is kept for compatibility
+    with existing saved profiles.
+    """
+    if personality_id and not profession_id and not profile_id:
+        existing = db.get_memory_profile(personality_id)
+        if existing:
+            profile_id = personality_id
+            personality_id = None
+    if profile_id:
+        profile = db.get_memory_profile(profile_id)
+        if not profile:
+            return {"error": f"Memory profile '{profile_id}' not found."}
+        personality_id = profile.get("development_plan", {}).get("personality_id")
+        profession_id = profile.get("development_plan", {}).get("profession_id")
+    else:
+        if not personality_id or not profession_id:
+            return {
+                "error": (
+                    "Provide personality_id and profession_id, or provide an "
+                    "existing profile_id for compatibility."
+                )
+            }
+        try:
+            profile = db.compose_memory_profile(personality_id, profession_id)
+        except ValueError as exc:
+            return {"error": str(exc)}
+    cfg.mark_profile_setup(
+        profile["profile_id"],
+        personality_id=personality_id,
+        profession_id=profession_id,
+    )
+    return {
+        "status": "configured",
+        "configured": cfg.profile_setup_configured,
+        "default_profile_id": cfg.default_profile_id,
+        "default_personality_id": cfg.default_personality_id or None,
+        "default_profession_id": cfg.default_profession_id or None,
+        "setup_completed_at": cfg.setup_completed_at,
+        "default_profile": profile,
+        "note": (
+            "New projects/contexts without an explicit profile will use this "
+            "composed personality/profession profile."
+        ),
+    }
+
+
+@mcp.tool()
+def get_memory_profile(profile_id: str) -> dict:
+    """Get a personality/profession memory profile."""
+    profile = db.get_memory_profile(profile_id)
+    if not profile:
+        return {"error": f"Memory profile '{profile_id}' not found."}
+    return {"profile": profile}
+
+
+@mcp.tool()
+def create_memory_profile(
+    profile_id: str,
+    traits: str,
+    profession: str,
+    development_plan: str | None = None,
+    calibration: str | None = None,
+    name: str | None = None,
+    description: str | None = None,
+    version: str = "1",
+) -> dict:
+    """Create or update a memory profile from JSON trait/profession configs."""
+    try:
+        traits_obj = json.loads(traits) if isinstance(traits, str) else traits
+        profession_obj = json.loads(profession) if isinstance(profession, str) else profession
+        plan_obj = (
+            json.loads(development_plan)
+            if isinstance(development_plan, str) and development_plan
+            else development_plan
+        )
+        calibration_obj = (
+            json.loads(calibration)
+            if isinstance(calibration, str) and calibration
+            else calibration
+        )
+    except (json.JSONDecodeError, TypeError) as exc:
+        return {"error": f"Invalid profile JSON: {exc}"}
+    profile = db.upsert_memory_profile(
+        profile_id=profile_id,
+        traits=traits_obj,
+        profession=profession_obj,
+        development_plan=plan_obj,
+        calibration=calibration_obj,
+        name=name,
+        description=description,
+        version=version,
+    )
+    return {"status": "saved", "profile": profile}
+
+
+@mcp.tool()
+def set_project_profile(project_name: str, profile_id: str | None) -> dict:
+    """Bind a memory profile to a project/context."""
+    project = _ensure_project(project_name)
+    if "error" in project:
+        return project
+    updated = db.set_project_profile(project["id"], profile_id)
+    if not updated:
+        return {"error": f"Memory profile '{profile_id}' not found."}
+    summary = curator.refresh_project_summary(project_id=project["id"])
+    return {
+        "status": "bound",
+        "project": updated,
+        "active_profile": db.get_active_profile_for_project(project["id"]),
+        "project_summary": summary.get("summary"),
+    }
 
 
 @mcp.tool()
@@ -281,6 +465,15 @@ def write_memory(
     if not db.get_hall(hall_id):
         warnings.append(f"Unknown hall_id '{hall_id}'; using 'general'.")
         hall_id = "general"
+    base_score = db._calc_score(importance, confidence, novelty, reusability, actionability)
+    active_profile = db.get_active_profile_for_project(project_id)
+    profile_score = score_memory_with_profile(
+        text=content,
+        memory_type=memory_type,
+        base_score=base_score,
+        profile=active_profile,
+        source_type="direct",
+    )
 
     try:
         memory = db.write_memory(
@@ -291,6 +484,13 @@ def write_memory(
             tags=tags_list, source_files=files_list,
             importance=importance, confidence=confidence,
             novelty=novelty, reusability=reusability, actionability=actionability,
+            profile_id=profile_score.get("profile_id"),
+            memory_layer=profile_score.get("memory_layer", "semantic"),
+            base_score=profile_score.get("base_score"),
+            store_score=profile_score.get("store_score"),
+            trait_features=profile_score.get("trait_features"),
+            profession_features=profile_score.get("profession_features"),
+            score_reason=profile_score.get("score_reason", ""),
         )
     except ValueError as exc:
         return {"error": str(exc)}
@@ -334,6 +534,7 @@ def write_memories_batch(project_name: str, memories: str) -> dict:
 
     rows = []
     vector_items = []
+    active_profile = db.get_active_profile_for_project(project["id"])
     for index, item in enumerate(items):
         if not isinstance(item, dict):
             return {"error": f"Memory at index {index} must be an object."}
@@ -366,6 +567,29 @@ def write_memories_batch(project_name: str, memories: str) -> dict:
             "tags": tags_list,
             "source_files": files_list,
         }
+        base_score = db._calc_score(
+            float(item.get("importance", 0.0) or 0.0),
+            float(item.get("confidence", 0.0) or 0.0),
+            float(item.get("novelty", 0.0) or 0.0),
+            float(item.get("reusability", 0.0) or 0.0),
+            float(item.get("actionability", 0.0) or 0.0),
+        )
+        profile_score = score_memory_with_profile(
+            text=content,
+            memory_type=memory_type,
+            base_score=base_score,
+            profile=active_profile,
+            source_type=str(item.get("source_type", "batch")),
+        )
+        row.update({
+            "profile_id": profile_score.get("profile_id"),
+            "memory_layer": profile_score.get("memory_layer", "semantic"),
+            "base_score": profile_score.get("base_score"),
+            "store_score": profile_score.get("store_score"),
+            "trait_features": profile_score.get("trait_features"),
+            "profession_features": profile_score.get("profession_features"),
+            "score_reason": profile_score.get("score_reason", ""),
+        })
         rows.append(row)
 
     try:
@@ -400,7 +624,8 @@ def write_memories_batch(project_name: str, memories: str) -> dict:
 def search_memory(
     project_name: str | None = None, wing_name: str | None = None,
     room_name: str | None = None, hall_id: str | None = None,
-    memory_type: str | None = None, keyword: str | None = None,
+    memory_type: str | None = None, memory_layer: str | None = None,
+    keyword: str | None = None,
     semantic_query: str | None = None, tags: str | None = None,
     confidence_label: str | None = None, min_score: float | None = None,
     limit: int = 20,
@@ -423,6 +648,7 @@ def search_memory(
                         if room:
                             room_id = room["id"]
 
+    active_profile = db.get_active_profile_for_project(project_id) if project_id else None
     if semantic_query:
         vr = vector_store.search(semantic_query, project_id=project_id, limit=limit)
         ids = [r.id for r in vr]
@@ -432,16 +658,29 @@ def search_memory(
                 if v.id == mem["id"]:
                     mem["semantic_similarity"] = v.similarity
                     break
+            rerank = score_retrieval_with_profile(
+                mem, semantic_query, active_profile,
+                semantic_relevance=mem.get("semantic_similarity"),
+            )
+            mem.update(rerank)
+        if memory_layer:
+            results = [mem for mem in results if mem.get("memory_layer") == memory_layer]
+        results.sort(key=lambda mem: mem.get("retrieve_score", 0), reverse=True)
         for mem in results:
             db.record_memory_hit(mem["id"])
     else:
         tags_list, _ = _parse_string_list(tags, "tags")
         results = db.search_memories(
             project_id=project_id, wing_id=wing_id, room_id=room_id,
-            hall_id=hall_id, memory_type=memory_type, keyword=keyword,
+            hall_id=hall_id, memory_type=memory_type, memory_layer=memory_layer,
+            keyword=keyword,
             tags=tags_list or None, confidence_label=confidence_label,
             min_score=min_score, limit=limit,
         )
+        query_text = keyword or memory_type or memory_layer or ""
+        for mem in results:
+            mem.update(score_retrieval_with_profile(mem, query_text, active_profile))
+        results.sort(key=lambda mem: mem.get("retrieve_score", mem.get("score", 0)), reverse=True)
         for mem in results:
             db.record_memory_hit(mem["id"])
 
@@ -455,6 +694,7 @@ def recall_for_task(project_name: str, task: str, limit: int = 10) -> dict:
     if "error" in project:
         return project
     project_id = project["id"]
+    active_profile = db.get_active_profile_for_project(project_id)
 
     sr = vector_store.search(task, project_id=project_id, limit=limit)
     kr = db.search_memories(project_id=project_id, keyword=task, limit=limit)
@@ -472,10 +712,16 @@ def recall_for_task(project_name: str, task: str, limit: int = 10) -> dict:
             seen.add(r["id"])
             combined.append(r)
     for m in combined:
+        m.update(score_retrieval_with_profile(
+            m, task, active_profile, semantic_relevance=m.get("semantic_similarity"),
+        ))
+    combined.sort(key=lambda m: m.get("retrieve_score", 0), reverse=True)
+    for m in combined:
         db.record_memory_hit(m["id"])
 
     return {
         "task": task, "project": project_name,
+        "active_profile": active_profile,
         "relevant_memories": combined[:limit],
     }
 
@@ -494,6 +740,7 @@ def wake_up(project_name: str) -> dict:
     if "error" in project:
         return project
     project_id = project["id"]
+    active_profile = db.get_active_profile_for_project(project_id)
 
     # L0: Palace layout
     wings = db.list_wings(project_id)
@@ -513,6 +760,7 @@ def wake_up(project_name: str) -> dict:
     # Compact context for AI
     context = {
         "project": project_name,
+        "active_profile": active_profile,
         "top_level_memory": {
             "project_core": project_core.get("content") if project_core else None,
             "latest_conversation_summary": (
@@ -548,6 +796,7 @@ def get_context_bundle(project_name: str) -> dict:
     tasks = db.list_task_snapshots(project_id, limit=10)
     decisions = db.list_decisions(project_id, limit=10)
     pending = db.list_pending_candidates(project_id)
+    active_profile = db.get_active_profile_for_project(project_id)
 
     by_type: dict[str, list] = {}
     for m in memories:
@@ -556,6 +805,7 @@ def get_context_bundle(project_name: str) -> dict:
 
     return {
         "project": project_name,
+        "active_profile": active_profile,
         "top_level_memory": {
             "project_core": project_core.get("content") if project_core else None,
             "latest_conversation_summary": (
@@ -708,6 +958,105 @@ def list_pending_candidates(project_name: str | None = None,
                     wid = wing["id"]
     candidates = db.list_pending_candidates(pid, wid)
     return {"count": len(candidates), "candidates": candidates}
+
+
+@mcp.tool()
+def record_memory_feedback(
+    project_name: str,
+    outcome_type: str,
+    task: str = "",
+    memory_ids: str | None = None,
+    feedback: str = "",
+    reflection: str = "",
+) -> dict:
+    """Record task outcome feedback for profile-aware memory growth.
+
+    outcome_type: success | ineffective | harmful | missed_recall
+    """
+    project = _ensure_project(project_name)
+    if "error" in project:
+        return project
+    allowed = {"success", "ineffective", "harmful", "missed_recall"}
+    if outcome_type not in allowed:
+        return {"error": f"outcome_type must be one of {sorted(allowed)}"}
+    ids, warning = _parse_string_list(memory_ids, "memory_ids")
+    active_profile = db.get_active_profile_for_project(project["id"])
+    outcome = db.record_outcome(
+        project_id=project["id"],
+        profile_id=active_profile.get("profile_id") if active_profile else None,
+        outcome_type=outcome_type,
+        task=task,
+        memory_ids=ids,
+        feedback=feedback,
+        reflection=reflection,
+    )
+    generated_memory = None
+    if feedback or reflection or outcome_type in {"harmful", "missed_recall"}:
+        layer = "error" if outcome_type in {"harmful", "missed_recall"} else "procedural"
+        memory_type = "error_pattern" if layer == "error" else "practice_pattern"
+        title = (
+            f"{outcome_type} feedback: {task[:48]}"
+            if task else f"{outcome_type} memory feedback"
+        )
+        content = "\n".join([
+            f"Outcome: {outcome_type}",
+            f"Task: {task or '(not specified)'}",
+            f"Feedback: {feedback or '(none)'}",
+            f"Reflection: {reflection or '(none)'}",
+            f"Referenced memories: {', '.join(ids) if ids else '(none)'}",
+        ])
+        base_score = 0.82 if layer == "error" else 0.72
+        profile_score = score_memory_with_profile(
+            text=content,
+            memory_type=memory_type,
+            base_score=base_score,
+            profile=active_profile,
+            source_type="feedback",
+        )
+        generated_memory = db.write_memory(
+            project_id=project["id"],
+            profile_id=profile_score.get("profile_id"),
+            memory_layer=layer,
+            memory_type=memory_type,
+            title=title,
+            content=content,
+            hall_id="bugs" if layer == "error" else "rules",
+            tags=["feedback", outcome_type, layer],
+            source_files=ids,
+            importance=0.85 if layer == "error" else 0.75,
+            confidence=0.8,
+            novelty=0.65,
+            reusability=0.85,
+            actionability=0.85,
+            base_score=profile_score.get("base_score"),
+            store_score=profile_score.get("store_score"),
+            trait_features=profile_score.get("trait_features"),
+            profession_features=profile_score.get("profession_features"),
+            score_reason=profile_score.get("score_reason", ""),
+            promotion_state="feedback",
+        )
+    result = {
+        "status": "recorded",
+        "outcome": outcome,
+        "active_profile": active_profile,
+        "generated_memory": generated_memory,
+    }
+    if warning:
+        result["warning"] = warning
+    return result
+
+
+@mcp.tool()
+def list_memory_feedback(project_name: str | None = None, limit: int = 50) -> dict:
+    """List recorded outcome feedback."""
+    project_id = None
+    if project_name:
+        project = _ensure_project(project_name)
+        if "error" in project:
+            return project
+        project_id = project["id"]
+    outcomes = db.list_outcomes(project_id, limit=limit)
+    return {"count": len(outcomes), "outcomes": outcomes}
 
 
 @mcp.tool()

@@ -6,6 +6,14 @@ The format is based on [Keep a Changelog](https://keepachangelog.com/en/1.1.0/),
 
 ## [Unreleased]
 
+### Added
+
+- Added profile-aware memory growth with built-in generalist, software engineer, research scientist, and clinical reasoner profiles.
+- Added memory profile tools, project profile binding, layered memory routing, store/retrieve scoring metadata, and outcome feedback records.
+- Added optional first-run profile setup with `memery configure`, `memery profiles`, `memery setup-status`, `get_setup_status`, and `configure_memory_defaults`.
+- New projects and contexts can now inherit the configured default personality/profession profile.
+- Expanded setup into a two-step personality-then-profession composition flow with 36 personality presets and 216 profession presets.
+
 ## [1.12] - 2026-06-18
 
 ### Fixed

@@ -19,6 +19,17 @@ from pathlib import Path
 from typing import Any
 
 from .config import get_config, Confidence
+from .profiles import (
+    build_runtime_profile,
+    compose_profile_from_presets,
+    get_default_profile,
+    list_default_profiles,
+    list_personality_presets,
+    list_profession_presets,
+    normalize_profile_payload,
+    refresh_profile_scaffold,
+    parse_json_object,
+)
 
 
 def _now() -> str:
@@ -94,6 +105,7 @@ class MemoryDB:
             slug TEXT NOT NULL UNIQUE,
             description TEXT DEFAULT '',
             context_type TEXT DEFAULT 'auto',
+            profile_id TEXT,
             created_at TEXT DEFAULT CURRENT_TIMESTAMP,
             updated_at TEXT DEFAULT CURRENT_TIMESTAMP
         );
@@ -147,10 +159,26 @@ class MemoryDB:
             ('tasks', 'Tasks', 'Task tracking and snapshots'),
             ('general', 'General', 'Uncategorized memories');
 
+        CREATE TABLE IF NOT EXISTS memory_profiles (
+            profile_id TEXT PRIMARY KEY,
+            name TEXT NOT NULL,
+            description TEXT DEFAULT '',
+            version TEXT DEFAULT '1',
+            traits TEXT NOT NULL DEFAULT '{}',
+            profession TEXT NOT NULL DEFAULT '{}',
+            development_plan TEXT NOT NULL DEFAULT '{}',
+            calibration TEXT NOT NULL DEFAULT '{}',
+            source TEXT DEFAULT 'custom',
+            created_at TEXT DEFAULT CURRENT_TIMESTAMP,
+            updated_at TEXT DEFAULT CURRENT_TIMESTAMP
+        );
+
         -- ── Memories (with confidence labels) ────────────────────────────
         CREATE TABLE IF NOT EXISTS memories (
             id TEXT PRIMARY KEY,
             project_id TEXT NOT NULL,
+            profile_id TEXT,
+            memory_layer TEXT DEFAULT 'semantic',
             wing_id TEXT,
             room_id TEXT,
             hall_id TEXT DEFAULT 'general',
@@ -167,7 +195,13 @@ class MemoryDB:
             novelty REAL DEFAULT 0.0,
             reusability REAL DEFAULT 0.0,
             actionability REAL DEFAULT 0.0,
+            base_score REAL DEFAULT 0.0,
+            store_score REAL DEFAULT 0.0,
             score REAL DEFAULT 0.0,
+            trait_features TEXT DEFAULT '{}',
+            profession_features TEXT DEFAULT '{}',
+            score_reason TEXT DEFAULT '',
+            promotion_state TEXT DEFAULT 'raw',
             hit_count INTEGER DEFAULT 0,
             last_hit_at TEXT,
             status TEXT DEFAULT 'active',
@@ -180,6 +214,8 @@ class MemoryDB:
             FOREIGN KEY (hall_id) REFERENCES halls(id)
         );
         CREATE INDEX IF NOT EXISTS idx_mem_project ON memories(project_id);
+        CREATE INDEX IF NOT EXISTS idx_mem_profile ON memories(profile_id);
+        CREATE INDEX IF NOT EXISTS idx_mem_layer ON memories(memory_layer);
         CREATE INDEX IF NOT EXISTS idx_mem_wing ON memories(wing_id);
         CREATE INDEX IF NOT EXISTS idx_mem_room ON memories(room_id);
         CREATE INDEX IF NOT EXISTS idx_mem_hall ON memories(hall_id);
@@ -235,6 +271,8 @@ class MemoryDB:
         CREATE TABLE IF NOT EXISTS memory_candidates (
             id TEXT PRIMARY KEY,
             project_id TEXT NOT NULL,
+            profile_id TEXT,
+            memory_layer TEXT DEFAULT 'semantic',
             wing_id TEXT,
             room_id TEXT,
             hall_id TEXT DEFAULT 'general',
@@ -250,7 +288,12 @@ class MemoryDB:
             novelty REAL DEFAULT 0.0,
             reusability REAL DEFAULT 0.0,
             actionability REAL DEFAULT 0.0,
+            base_score REAL DEFAULT 0.0,
+            store_score REAL DEFAULT 0.0,
             score REAL DEFAULT 0.0,
+            trait_features TEXT DEFAULT '{}',
+            profession_features TEXT DEFAULT '{}',
+            score_reason TEXT DEFAULT '',
             status TEXT DEFAULT 'pending',
             duplicate_of TEXT,
             created_at TEXT DEFAULT CURRENT_TIMESTAMP,
@@ -261,6 +304,8 @@ class MemoryDB:
         CREATE INDEX IF NOT EXISTS idx_candidates_status ON memory_candidates(status);
         CREATE INDEX IF NOT EXISTS idx_candidates_project_status_score
             ON memory_candidates(project_id, status, score DESC);
+        CREATE INDEX IF NOT EXISTS idx_candidates_profile ON memory_candidates(profile_id);
+        CREATE INDEX IF NOT EXISTS idx_candidates_layer ON memory_candidates(memory_layer);
 
         -- ── Reviews, Compactions, Tasks, Decisions (unchanged core) ──────
         CREATE TABLE IF NOT EXISTS memory_reviews (
@@ -320,6 +365,23 @@ class MemoryDB:
         CREATE INDEX IF NOT EXISTS idx_decisions_project_created
             ON decisions(project_id, created_at DESC);
 
+        CREATE TABLE IF NOT EXISTS outcome_records (
+            id TEXT PRIMARY KEY,
+            project_id TEXT NOT NULL,
+            profile_id TEXT,
+            task TEXT NOT NULL DEFAULT '',
+            outcome_type TEXT NOT NULL,
+            memory_ids TEXT DEFAULT '[]',
+            feedback TEXT DEFAULT '',
+            reflection TEXT DEFAULT '',
+            created_at TEXT DEFAULT CURRENT_TIMESTAMP,
+            FOREIGN KEY (project_id) REFERENCES projects(id),
+            FOREIGN KEY (profile_id) REFERENCES memory_profiles(profile_id)
+        );
+        CREATE INDEX IF NOT EXISTS idx_outcome_project ON outcome_records(project_id);
+        CREATE INDEX IF NOT EXISTS idx_outcome_profile ON outcome_records(profile_id);
+        CREATE INDEX IF NOT EXISTS idx_outcome_type ON outcome_records(outcome_type);
+
         CREATE TRIGGER IF NOT EXISTS trg_project_revision_create
         AFTER INSERT ON projects
         BEGIN
@@ -328,7 +390,7 @@ class MemoryDB:
         END;
 
         CREATE TRIGGER IF NOT EXISTS trg_project_revision_update
-        AFTER UPDATE OF description, context_type ON projects
+        AFTER UPDATE OF description, context_type, profile_id ON projects
         BEGIN
             INSERT INTO project_revisions(project_id, revision, updated_at)
             VALUES (NEW.id, 1, CURRENT_TIMESTAMP)
@@ -427,12 +489,50 @@ class MemoryDB:
                     f"ALTER TABLE {table} ADD COLUMN {name} {definition}"
                 )
 
+    def _seed_default_profiles(self) -> None:
+        if not self._table_exists("memory_profiles"):
+            return
+        now = _now()
+        for profile in list_default_profiles():
+            self.conn.execute(
+                """INSERT OR IGNORE INTO memory_profiles
+                   (profile_id, name, description, version, traits, profession,
+                    development_plan, calibration, source, created_at, updated_at)
+                   VALUES (?,?,?,?,?,?,?,?,?,?,?)""",
+                (
+                    profile["profile_id"],
+                    profile.get("name", profile["profile_id"]),
+                    profile.get("description", ""),
+                    profile.get("version", "1"),
+                    _json_dumps(profile.get("traits", {})),
+                    _json_dumps(profile.get("profession", {})),
+                    _json_dumps(profile.get("development_plan", {})),
+                    _json_dumps(profile.get("calibration", {})),
+                    "built-in",
+                    now,
+                    now,
+                ),
+            )
+
     def _migrate_existing_schema(self) -> None:
         """Add columns introduced by newer Memery versions to old databases."""
         self._ensure_columns("projects", {
             "slug": "TEXT DEFAULT ''",
             "description": "TEXT DEFAULT ''",
             "context_type": "TEXT DEFAULT 'auto'",
+            "profile_id": "TEXT",
+            "created_at": "TEXT",
+            "updated_at": "TEXT",
+        })
+        self._ensure_columns("memory_profiles", {
+            "name": "TEXT DEFAULT ''",
+            "description": "TEXT DEFAULT ''",
+            "version": "TEXT DEFAULT '1'",
+            "traits": "TEXT DEFAULT '{}'",
+            "profession": "TEXT DEFAULT '{}'",
+            "development_plan": "TEXT DEFAULT '{}'",
+            "calibration": "TEXT DEFAULT '{}'",
+            "source": "TEXT DEFAULT 'custom'",
             "created_at": "TEXT",
             "updated_at": "TEXT",
         })
@@ -456,6 +556,8 @@ class MemoryDB:
         })
         self._ensure_columns("memories", {
             "project_id": "TEXT",
+            "profile_id": "TEXT",
+            "memory_layer": "TEXT DEFAULT 'semantic'",
             "wing_id": "TEXT",
             "room_id": "TEXT",
             "hall_id": "TEXT DEFAULT 'general'",
@@ -471,7 +573,13 @@ class MemoryDB:
             "novelty": "REAL DEFAULT 0.0",
             "reusability": "REAL DEFAULT 0.0",
             "actionability": "REAL DEFAULT 0.0",
+            "base_score": "REAL DEFAULT 0.0",
+            "store_score": "REAL DEFAULT 0.0",
             "score": "REAL DEFAULT 0.0",
+            "trait_features": "TEXT DEFAULT '{}'",
+            "profession_features": "TEXT DEFAULT '{}'",
+            "score_reason": "TEXT DEFAULT ''",
+            "promotion_state": "TEXT DEFAULT 'raw'",
             "hit_count": "INTEGER DEFAULT 0",
             "last_hit_at": "TEXT",
             "status": "TEXT DEFAULT 'active'",
@@ -503,6 +611,8 @@ class MemoryDB:
         })
         self._ensure_columns("memory_candidates", {
             "project_id": "TEXT",
+            "profile_id": "TEXT",
+            "memory_layer": "TEXT DEFAULT 'semantic'",
             "wing_id": "TEXT",
             "room_id": "TEXT",
             "hall_id": "TEXT DEFAULT 'general'",
@@ -518,7 +628,12 @@ class MemoryDB:
             "novelty": "REAL DEFAULT 0.0",
             "reusability": "REAL DEFAULT 0.0",
             "actionability": "REAL DEFAULT 0.0",
+            "base_score": "REAL DEFAULT 0.0",
+            "store_score": "REAL DEFAULT 0.0",
             "score": "REAL DEFAULT 0.0",
+            "trait_features": "TEXT DEFAULT '{}'",
+            "profession_features": "TEXT DEFAULT '{}'",
+            "score_reason": "TEXT DEFAULT ''",
             "status": "TEXT DEFAULT 'pending'",
             "duplicate_of": "TEXT",
             "created_at": "TEXT",
@@ -562,9 +677,33 @@ class MemoryDB:
             "status": "TEXT DEFAULT 'active'",
             "created_at": "TEXT",
         })
+        self._ensure_columns("outcome_records", {
+            "project_id": "TEXT",
+            "profile_id": "TEXT",
+            "task": "TEXT DEFAULT ''",
+            "outcome_type": "TEXT DEFAULT ''",
+            "memory_ids": "TEXT DEFAULT '[]'",
+            "feedback": "TEXT DEFAULT ''",
+            "reflection": "TEXT DEFAULT ''",
+            "created_at": "TEXT",
+        })
         self.conn.execute(
             "UPDATE projects SET slug = name WHERE (slug IS NULL OR slug = '')"
         )
+        self.conn.execute(
+            "UPDATE memories SET base_score = score WHERE base_score IS NULL OR base_score = 0"
+        )
+        self.conn.execute(
+            "UPDATE memories SET store_score = score WHERE store_score IS NULL OR store_score = 0"
+        )
+        if self._table_exists("memory_candidates"):
+            self.conn.execute(
+                "UPDATE memory_candidates SET base_score = score WHERE base_score IS NULL OR base_score = 0"
+            )
+            self.conn.execute(
+                "UPDATE memory_candidates SET store_score = score WHERE store_score IS NULL OR store_score = 0"
+            )
+        self._seed_default_profiles()
         self.conn.commit()
 
     def _ensure_default_wings(self) -> None:
@@ -720,16 +859,26 @@ class MemoryDB:
     # Projects
     # ═══════════════════════════════════════════════════════════════════════
 
-    def create_project(self, name: str, slug: str | None = None,
-                       description: str = "", context_type: str = "auto") -> dict:
+    def create_project(
+        self,
+        name: str,
+        slug: str | None = None,
+        description: str = "",
+        context_type: str = "auto",
+        profile_id: str | None = None,
+    ) -> dict:
         slug = slug or name.lower().replace(" ", "-").replace("_", "-")
         pid = _uid()
         now = _now()
+        if not profile_id:
+            profile_id = self._configured_default_profile_id()
+        if profile_id and not self.get_memory_profile(profile_id):
+            profile_id = None
         self.conn.execute(
             """INSERT INTO projects
-               (id, name, slug, description, context_type, created_at, updated_at)
-               VALUES (?,?,?,?,?,?,?)""",
-            (pid, name, slug, description, context_type, now, now),
+               (id, name, slug, description, context_type, profile_id, created_at, updated_at)
+               VALUES (?,?,?,?,?,?,?,?)""",
+            (pid, name, slug, description, context_type, profile_id, now, now),
         )
         self.conn.commit()
         # Auto-create a default wing for this project
@@ -747,6 +896,151 @@ class MemoryDB:
     def list_projects(self) -> list[dict]:
         rows = self.conn.execute("SELECT * FROM projects ORDER BY name").fetchall()
         return [dict(r) for r in rows]
+
+    def list_memory_profiles(self) -> list[dict]:
+        rows = self.conn.execute(
+            "SELECT * FROM memory_profiles ORDER BY source, profile_id"
+        ).fetchall()
+        return [
+            refresh_profile_scaffold(build_runtime_profile(dict(row)))
+            for row in rows
+        ]
+
+    def list_personality_presets(self) -> list[dict]:
+        return list_personality_presets()
+
+    def list_profession_presets(self) -> list[dict]:
+        return list_profession_presets()
+
+    def get_memory_profile(self, profile_id: str | None) -> dict | None:
+        if not profile_id:
+            return None
+        row = self.conn.execute(
+            "SELECT * FROM memory_profiles WHERE profile_id=?", (profile_id,)
+        ).fetchone()
+        if row:
+            return refresh_profile_scaffold(build_runtime_profile(dict(row)))
+        default = get_default_profile(profile_id)
+        if default:
+            return default
+        return None
+
+    def _configured_default_profile_id(self) -> str | None:
+        cfg = get_config()
+        profile_id = (cfg.default_profile_id or "").strip()
+        if profile_id and self.get_memory_profile(profile_id):
+            return profile_id
+        return None
+
+    def get_active_profile_for_project(self, project_id: str) -> dict | None:
+        project = self.get_project(project_id)
+        if not project:
+            return None
+        profile = self.get_memory_profile(project.get("profile_id"))
+        if profile:
+            return profile
+        configured_profile_id = self._configured_default_profile_id()
+        if configured_profile_id:
+            return self.get_memory_profile(configured_profile_id)
+        context_type = (project.get("context_type") or "").lower()
+        fallback_by_context = {
+            "software": "software_engineer_v1",
+            "research": "research_scientist_v1",
+            "general": "generalist_v1",
+            "learning": "generalist_v1",
+            "business": "generalist_v1",
+        }
+        return self.get_memory_profile(fallback_by_context.get(context_type, "generalist_v1"))
+
+    def upsert_memory_profile(
+        self,
+        profile_id: str,
+        traits: Any,
+        profession: Any,
+        development_plan: Any | None = None,
+        calibration: Any | None = None,
+        name: str | None = None,
+        description: str | None = None,
+        version: str = "1",
+        source: str = "custom",
+    ) -> dict:
+        profile = normalize_profile_payload(
+            profile_id=profile_id,
+            traits=traits,
+            profession=profession,
+            development_plan=development_plan,
+            calibration=calibration,
+            name=name,
+            description=description,
+            version=version,
+        )
+        now = _now()
+        self.conn.execute(
+            """INSERT INTO memory_profiles
+               (profile_id, name, description, version, traits, profession,
+                development_plan, calibration, source, created_at, updated_at)
+               VALUES (?,?,?,?,?,?,?,?,?,?,?)
+               ON CONFLICT(profile_id) DO UPDATE SET
+                   name=excluded.name,
+                   description=excluded.description,
+                   version=excluded.version,
+                   traits=excluded.traits,
+                   profession=excluded.profession,
+                   development_plan=excluded.development_plan,
+                   calibration=excluded.calibration,
+                   source=excluded.source,
+                   updated_at=excluded.updated_at""",
+            (
+                profile["profile_id"],
+                profile["name"],
+                profile["description"],
+                profile["version"],
+                _json_dumps(profile["traits"]),
+                _json_dumps(profile["profession"]),
+                _json_dumps(profile["development_plan"]),
+                _json_dumps(profile["calibration"]),
+                source,
+                now,
+                now,
+            ),
+        )
+        self.conn.commit()
+        return self.get_memory_profile(profile_id)  # type: ignore
+
+    def compose_memory_profile(
+        self,
+        personality_id: str,
+        profession_id: str,
+        profile_id: str | None = None,
+    ) -> dict:
+        profile = compose_profile_from_presets(
+            personality_id=personality_id,
+            profession_id=profession_id,
+            profile_id=profile_id,
+        )
+        return self.upsert_memory_profile(
+            profile_id=profile["profile_id"],
+            traits=profile["traits"],
+            profession=profile["profession"],
+            development_plan=profile["development_plan"],
+            calibration=profile["calibration"],
+            name=profile["name"],
+            description=profile["description"],
+            version=profile["version"],
+            source="composed",
+        )
+
+    def set_project_profile(self, project_id: str, profile_id: str | None) -> dict | None:
+        if profile_id and not self.get_memory_profile(profile_id):
+            return None
+        now = _now()
+        self.conn.execute(
+            "UPDATE projects SET profile_id=?, updated_at=? WHERE id=?",
+            (profile_id, now, project_id),
+        )
+        self._bump_project_revision(self.conn, project_id)
+        self.conn.commit()
+        return self.get_project(project_id)
 
     def get_project_revision(self, project_id: str) -> int:
         row = self.conn.execute(
@@ -787,6 +1081,14 @@ class MemoryDB:
         novelty: float = 0.0,
         reusability: float = 0.0,
         actionability: float = 0.0,
+        profile_id: str | None = None,
+        memory_layer: str = "semantic",
+        base_score: float | None = None,
+        store_score: float | None = None,
+        trait_features: dict | str | None = None,
+        profession_features: dict | str | None = None,
+        score_reason: str = "",
+        promotion_state: str = "raw",
     ) -> dict:
         mid = _uid()
         now = _now()
@@ -803,20 +1105,32 @@ class MemoryDB:
         novelty = self._normalize_float(novelty)
         reusability = self._normalize_float(reusability)
         actionability = self._normalize_float(actionability)
-        score = self._calc_score(importance, confidence, novelty, reusability, actionability)
+        calculated_score = self._calc_score(
+            importance, confidence, novelty, reusability, actionability
+        )
+        base_score = self._normalize_float(base_score, calculated_score)
+        store_score = self._normalize_float(store_score, calculated_score)
+        score = store_score
+        trait_features = parse_json_object(trait_features)
+        profession_features = parse_json_object(profession_features)
         self.conn.execute(
-            """INSERT INTO memories (id, project_id, wing_id, room_id, hall_id,
+            """INSERT INTO memories (id, project_id, profile_id, memory_layer,
+               wing_id, room_id, hall_id,
                memory_type, title, content, confidence_label, confidence_score,
                tags, source_files,
                importance, confidence, novelty, reusability, actionability,
-               score, created_at, updated_at)
-               VALUES (?,?,?,?,?,?,?,?,?,?,?,?,?,?,?,?,?,?,?,?)""",
+               base_score, store_score, score, trait_features, profession_features,
+               score_reason, promotion_state, created_at, updated_at)
+               VALUES (?,?,?,?,?,?,?,?,?,?,?,?,?,?,?,?,?,?,?,?,?,?,?,?,?,?,?,?)""",
             (
-                mid, project_id, wing_id, room_id, hall_id,
+                mid, project_id, profile_id, memory_layer,
+                wing_id, room_id, hall_id,
                 memory_type, title, content, confidence_label, confidence_score,
                 _json_dumps(tags or []), _json_dumps(source_files or []),
                 importance, confidence, novelty, reusability, actionability,
-                score, now, now,
+                base_score, store_score, score,
+                _json_dumps(trait_features), _json_dumps(profession_features),
+                score_reason, promotion_state, now, now,
             ),
         )
         if memory_type not in {
@@ -849,12 +1163,18 @@ class MemoryDB:
             novelty = self._normalize_float(item.get("novelty", 0.0))
             reusability = self._normalize_float(item.get("reusability", 0.0))
             actionability = self._normalize_float(item.get("actionability", 0.0))
+            calculated_score = self._calc_score(
+                importance, confidence, novelty, reusability, actionability,
+            )
+            base_score = self._normalize_float(item.get("base_score"), calculated_score)
+            store_score = self._normalize_float(item.get("store_score"), calculated_score)
             if memory_type not in {
                 "project_core", "latest_conversation_summary", "project_summary",
             }:
                 project_ids_to_bump.add(project_id)
             rows.append((
-                mid, project_id, item.get("wing_id"), item.get("room_id"),
+                mid, project_id, item.get("profile_id"), item.get("memory_layer", "semantic"),
+                item.get("wing_id"), item.get("room_id"),
                 self._normalize_hall_id(item.get("hall_id", "general")),
                 memory_type, title, content,
                 self._clean_text(item.get("confidence_label"), Confidence.INFERRED),
@@ -862,19 +1182,24 @@ class MemoryDB:
                 _json_dumps(self._normalize_string_list(item.get("tags"))),
                 _json_dumps(self._normalize_string_list(item.get("source_files"))),
                 importance, confidence, novelty, reusability, actionability,
-                self._calc_score(
-                    importance, confidence, novelty, reusability, actionability,
-                ),
+                base_score, store_score, store_score,
+                _json_dumps(parse_json_object(item.get("trait_features"))),
+                _json_dumps(parse_json_object(item.get("profession_features"))),
+                self._clean_text(item.get("score_reason")),
+                self._clean_text(item.get("promotion_state"), "raw"),
                 now, now,
             ))
         connection = self.conn
         try:
             connection.executemany(
-                """INSERT INTO memories (id, project_id, wing_id, room_id, hall_id,
+                """INSERT INTO memories (id, project_id, profile_id, memory_layer,
+                   wing_id, room_id, hall_id,
                    memory_type, title, content, confidence_label, confidence_score,
                    tags, source_files, importance, confidence, novelty, reusability,
-                   actionability, score, created_at, updated_at)
-                   VALUES (?,?,?,?,?,?,?,?,?,?,?,?,?,?,?,?,?,?,?,?)""",
+                   actionability, base_score, store_score, score, trait_features,
+                   profession_features, score_reason, promotion_state,
+                   created_at, updated_at)
+                   VALUES (?,?,?,?,?,?,?,?,?,?,?,?,?,?,?,?,?,?,?,?,?,?,?,?,?,?,?,?)""",
                 rows,
             )
             for project_id in project_ids_to_bump:
@@ -923,10 +1248,16 @@ class MemoryDB:
         score_fields = {"importance", "confidence", "novelty", "reusability", "actionability"}
         if score_fields & set(kwargs.keys()):
             merged = {**existing, **kwargs}
-            kwargs["score"] = self._calc_score(
+            calculated = self._calc_score(
                 merged["importance"], merged["confidence"],
                 merged["novelty"], merged["reusability"], merged["actionability"],
             )
+            kwargs.setdefault("base_score", calculated)
+            kwargs.setdefault("store_score", calculated)
+            kwargs["score"] = kwargs["store_score"]
+        for json_field in ("trait_features", "profession_features"):
+            if json_field in kwargs:
+                kwargs[json_field] = _json_dumps(parse_json_object(kwargs[json_field]))
         kwargs["updated_at"] = now
         set_clause = ", ".join(f"{k}=?" for k in kwargs)
         values = list(kwargs.values()) + [mid]
@@ -946,6 +1277,8 @@ class MemoryDB:
         room_id: str | None = None,
         hall_id: str | None = None,
         memory_type: str | None = None,
+        memory_layer: str | None = None,
+        profile_id: str | None = None,
         keyword: str | None = None,
         tags: list[str] | None = None,
         confidence_label: str | None = None,
@@ -970,6 +1303,12 @@ class MemoryDB:
         if memory_type:
             conditions.append("memory_type=?")
             params.append(memory_type)
+        if memory_layer:
+            conditions.append("memory_layer=?")
+            params.append(memory_layer)
+        if profile_id:
+            conditions.append("profile_id=?")
+            params.append(profile_id)
         if keyword:
             conditions.append("(title LIKE ? OR content LIKE ?)")
             params.extend([f"%{keyword}%", f"%{keyword}%"])
@@ -1002,7 +1341,7 @@ class MemoryDB:
             if remaining:
                 ordinary_rows = self.conn.execute(
                     f"""SELECT * FROM memories WHERE {where}
-                        ORDER BY score DESC, updated_at DESC LIMIT ?""",
+                        ORDER BY store_score DESC, score DESC, updated_at DESC LIMIT ?""",
                     [*params, remaining + 3],
                 ).fetchall()
                 ordinary = [
@@ -1013,7 +1352,8 @@ class MemoryDB:
                 ][:remaining]
             return [dict(row) for row in [*pinned, *ordinary]]
         rows = self.conn.execute(
-            f"SELECT * FROM memories WHERE {where} ORDER BY score DESC, updated_at DESC LIMIT ?",
+            f"""SELECT * FROM memories WHERE {where}
+                ORDER BY store_score DESC, score DESC, updated_at DESC LIMIT ?""",
             [*params, limit],
         ).fetchall()
         return [dict(row) for row in rows]
@@ -1108,7 +1448,8 @@ class MemoryDB:
         """Return the bounded, highest-value source set for project summaries."""
         priority_types = (
             "goal", "principle", "architecture", "decision", "preference",
-            "product_rule", "api_contract", "db_schema",
+            "product_rule", "coding_rule", "api_contract", "db_schema",
+            "error_pattern", "practice_pattern", "retrieval_cue",
         )
         collected: list[dict] = []
         seen = set()
@@ -1314,23 +1655,39 @@ class MemoryDB:
         novelty: float = 0.0,
         reusability: float = 0.0,
         actionability: float = 0.0,
+        profile_id: str | None = None,
+        memory_layer: str = "semantic",
+        base_score: float | None = None,
+        store_score: float | None = None,
+        trait_features: dict | str | None = None,
+        profession_features: dict | str | None = None,
+        score_reason: str = "",
     ) -> dict:
         cid = _uid()
         now = _now()
         score = self._calc_score(importance, confidence, novelty, reusability, actionability)
+        base_score = self._normalize_float(base_score, score)
+        store_score = self._normalize_float(store_score, score)
+        trait_features = parse_json_object(trait_features)
+        profession_features = parse_json_object(profession_features)
         self.conn.execute(
-            """INSERT INTO memory_candidates (id, project_id, wing_id, room_id, hall_id,
+            """INSERT INTO memory_candidates (id, project_id, profile_id, memory_layer,
+               wing_id, room_id, hall_id,
                source_type, raw_text, extracted_title, extracted_content,
                candidate_type, reason, confidence_label,
                importance, confidence, novelty, reusability, actionability,
-               score, status, created_at)
-               VALUES (?,?,?,?,?,?,?,?,?,?,?,?,?,?,?,?,?,?,'pending',?)""",
+               base_score, store_score, score, trait_features, profession_features,
+               score_reason, status, created_at)
+               VALUES (?,?,?,?,?,?,?,?,?,?,?,?,?,?,?,?,?,?,?,?,?,?,?,?,?,'pending',?)""",
             (
-                cid, project_id, wing_id, room_id, hall_id,
+                cid, project_id, profile_id, memory_layer,
+                wing_id, room_id, hall_id,
                 source_type, raw_text, extracted_title, extracted_content,
                 candidate_type, reason, confidence_label,
                 importance, confidence, novelty, reusability, actionability,
-                score, now,
+                base_score, store_score, store_score,
+                _json_dumps(trait_features), _json_dumps(profession_features),
+                score_reason, now,
             ),
         )
         self.conn.commit()
@@ -1347,10 +1704,16 @@ class MemoryDB:
             existing = self.get_candidate(cid)
             if existing:
                 merged = {**existing, **kwargs}
-                kwargs["score"] = self._calc_score(
+                calculated = self._calc_score(
                     merged["importance"], merged["confidence"],
                     merged["novelty"], merged["reusability"], merged["actionability"],
                 )
+                kwargs.setdefault("base_score", calculated)
+                kwargs.setdefault("store_score", calculated)
+                kwargs["score"] = kwargs["store_score"]
+        for json_field in ("trait_features", "profession_features"):
+            if json_field in kwargs:
+                kwargs[json_field] = _json_dumps(parse_json_object(kwargs[json_field]))
         kwargs["reviewed_at"] = now
         set_clause = ", ".join(f"{k}=?" for k in kwargs)
         values = list(kwargs.values()) + [cid]
@@ -1463,6 +1826,76 @@ class MemoryDB:
     # Helpers
     # ═══════════════════════════════════════════════════════════════════════
 
+    def record_outcome(
+        self,
+        project_id: str,
+        outcome_type: str,
+        task: str = "",
+        memory_ids: list[str] | None = None,
+        feedback: str = "",
+        reflection: str = "",
+        profile_id: str | None = None,
+    ) -> dict:
+        oid = _uid()
+        now = _now()
+        memory_ids = self._normalize_string_list(memory_ids)
+        self.conn.execute(
+            """INSERT INTO outcome_records
+               (id, project_id, profile_id, task, outcome_type, memory_ids,
+                feedback, reflection, created_at)
+               VALUES (?,?,?,?,?,?,?,?,?)""",
+            (
+                oid, project_id, profile_id, task, outcome_type,
+                _json_dumps(memory_ids), feedback, reflection, now,
+            ),
+        )
+        for memory_id in memory_ids:
+            existing = self.get_memory(memory_id)
+            if not existing:
+                continue
+            current = float(existing.get("store_score") or existing.get("score") or 0)
+            if outcome_type == "success":
+                new_score = min(1.0, current + 0.03)
+                self.conn.execute(
+                    """UPDATE memories
+                       SET store_score=?, score=?, hit_count=hit_count+1,
+                           last_hit_at=?, updated_at=?
+                       WHERE id=?""",
+                    (new_score, new_score, now, now, memory_id),
+                )
+            elif outcome_type in {"ineffective", "harmful"}:
+                delta = 0.05 if outcome_type == "ineffective" else 0.12
+                new_score = max(0.0, current - delta)
+                promotion_state = (
+                    "quarantined"
+                    if outcome_type == "harmful"
+                    else existing.get("promotion_state", "raw")
+                )
+                self.conn.execute(
+                    """UPDATE memories
+                       SET store_score=?, score=?, promotion_state=?, updated_at=?
+                       WHERE id=?""",
+                    (new_score, new_score, promotion_state, now, memory_id),
+                )
+        self._bump_project_revision(self.conn, project_id)
+        self.conn.commit()
+        row = self.conn.execute(
+            "SELECT * FROM outcome_records WHERE id=?", (oid,)
+        ).fetchone()
+        return dict(row)
+
+    def list_outcomes(self, project_id: str | None = None, limit: int = 50) -> list[dict]:
+        params: list[Any] = []
+        where = ""
+        if project_id:
+            where = "WHERE project_id=?"
+            params.append(project_id)
+        rows = self.conn.execute(
+            f"SELECT * FROM outcome_records {where} ORDER BY created_at DESC LIMIT ?",
+            [*params, limit],
+        ).fetchall()
+        return [dict(row) for row in rows]
+
     @staticmethod
     def _calc_score(importance: float, confidence: float, novelty: float,
                     reusability: float, actionability: float) -> float:
@@ -1493,16 +1926,36 @@ class MemoryDB:
         ).fetchall()
         for r in rows2:
             by_confidence[r["confidence_label"]] = r["c"]
+        by_layer = {}
+        rows3 = self.conn.execute(
+            f"SELECT memory_layer, COUNT(*) as c FROM memories {where} GROUP BY memory_layer", params
+        ).fetchall()
+        for r in rows3:
+            by_layer[r["memory_layer"] or "semantic"] = r["c"]
+        by_profile = {}
+        rows4 = self.conn.execute(
+            f"SELECT profile_id, COUNT(*) as c FROM memories {where} GROUP BY profile_id", params
+        ).fetchall()
+        for r in rows4:
+            by_profile[r["profile_id"] or "unprofiled"] = r["c"]
 
         edge_count = self.conn.execute("SELECT COUNT(*) as c FROM memory_edges").fetchone()["c"]
         triple_count = self.conn.execute("SELECT COUNT(*) as c FROM temporal_triples WHERE invalidated_at IS NULL").fetchone()["c"]
+        outcome_count = self.conn.execute(
+            "SELECT COUNT(*) as c FROM outcome_records"
+            + (" WHERE project_id=?" if project_id else ""),
+            params,
+        ).fetchone()["c"]
 
         return {
             "total_memories": total,
             "by_type": by_type,
             "by_confidence": by_confidence,
+            "by_layer": by_layer,
+            "by_profile": by_profile,
             "total_edges": edge_count,
             "active_triples": triple_count,
+            "outcomes": outcome_count,
         }
 
     def close(self) -> None:
