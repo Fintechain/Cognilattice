@@ -79,14 +79,13 @@ class MemoryDB:
                 check_same_thread=False,
             )
             connection.row_factory = sqlite3.Row
-            connection.execute("PRAGMA journal_mode=WAL")
+            connection.execute("PRAGMA journal_mode=DELETE")
             connection.execute("PRAGMA foreign_keys=ON")
             connection.execute("PRAGMA busy_timeout=30000")
             connection.execute("PRAGMA synchronous=NORMAL")
             connection.execute("PRAGMA temp_store=MEMORY")
             connection.execute("PRAGMA cache_size=-32768")
             connection.execute("PRAGMA mmap_size=268435456")
-            connection.execute("PRAGMA wal_autocheckpoint=1000")
             self._local.connection = connection
             with self._connections_lock:
                 self._connections.append(connection)

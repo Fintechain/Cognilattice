@@ -20,13 +20,19 @@ dist/
 *.egg-info/
 *.egg
 
-# Local runtime data
+# Local runtime data — user data lives in ~/.memery/ (configurable via env)
+# Never commit databases, vector indexes, or pickled caches
+data/
 memory.db
 memory.db-shm
 memory.db-wal
+memory.db-journal
+*.db
+*.sqlite
 *.sqlite3
 lancedb_data/
 memery_data/
+*.pkl
 cache/
 .runtime/
 .git-write/
