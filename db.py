@@ -382,6 +382,138 @@ class MemoryDB:
         CREATE INDEX IF NOT EXISTS idx_outcome_profile ON outcome_records(profile_id);
         CREATE INDEX IF NOT EXISTS idx_outcome_type ON outcome_records(outcome_type);
 
+        -- Memory Steelprint: immutable provenance and grounded-answer audit trail.
+        CREATE TABLE IF NOT EXISTS provenance_sources (
+            id TEXT PRIMARY KEY,
+            project_id TEXT NOT NULL,
+            source_type TEXT NOT NULL DEFAULT 'document',
+            uri TEXT NOT NULL,
+            title TEXT DEFAULT '',
+            version TEXT DEFAULT '',
+            content_hash TEXT NOT NULL,
+            trust_score REAL DEFAULT 0.8,
+            metadata TEXT DEFAULT '{}',
+            created_at TEXT DEFAULT CURRENT_TIMESTAMP,
+            FOREIGN KEY (project_id) REFERENCES projects(id) ON DELETE CASCADE,
+            UNIQUE(project_id, uri, version, content_hash)
+        );
+        CREATE INDEX IF NOT EXISTS idx_provenance_project
+            ON provenance_sources(project_id, created_at DESC);
+
+        CREATE TABLE IF NOT EXISTS evidence_spans (
+            id TEXT PRIMARY KEY,
+            source_id TEXT NOT NULL,
+            page_number INTEGER,
+            paragraph_number INTEGER,
+            section_title TEXT DEFAULT '',
+            line_start INTEGER,
+            line_end INTEGER,
+            char_start INTEGER,
+            char_end INTEGER,
+            quoted_text TEXT NOT NULL,
+            content_hash TEXT NOT NULL,
+            locator TEXT DEFAULT '',
+            metadata TEXT DEFAULT '{}',
+            created_at TEXT DEFAULT CURRENT_TIMESTAMP,
+            FOREIGN KEY (source_id) REFERENCES provenance_sources(id) ON DELETE CASCADE
+        );
+        CREATE INDEX IF NOT EXISTS idx_evidence_source ON evidence_spans(source_id);
+
+        CREATE TABLE IF NOT EXISTS memory_steelprints (
+            id TEXT PRIMARY KEY,
+            memory_id TEXT NOT NULL,
+            evidence_id TEXT NOT NULL,
+            claim_subject TEXT DEFAULT '',
+            claim_predicate TEXT DEFAULT '',
+            claim_object TEXT DEFAULT '',
+            support_type TEXT NOT NULL DEFAULT 'supports',
+            entailment_score REAL DEFAULT 1.0,
+            steelprint_hash TEXT NOT NULL,
+            created_at TEXT DEFAULT CURRENT_TIMESTAMP,
+            FOREIGN KEY (memory_id) REFERENCES memories(id) ON DELETE CASCADE,
+            FOREIGN KEY (evidence_id) REFERENCES evidence_spans(id) ON DELETE CASCADE,
+            UNIQUE(memory_id, evidence_id, claim_subject, claim_predicate, claim_object)
+        );
+        CREATE INDEX IF NOT EXISTS idx_steelprint_memory ON memory_steelprints(memory_id);
+        CREATE INDEX IF NOT EXISTS idx_steelprint_claim
+            ON memory_steelprints(claim_subject, claim_predicate);
+
+        CREATE TABLE IF NOT EXISTS memory_conflicts (
+            id TEXT PRIMARY KEY,
+            project_id TEXT NOT NULL,
+            memory_id_a TEXT NOT NULL,
+            memory_id_b TEXT NOT NULL,
+            claim_subject TEXT DEFAULT '',
+            claim_predicate TEXT DEFAULT '',
+            conflict_type TEXT NOT NULL DEFAULT 'contradiction',
+            severity REAL DEFAULT 0.5,
+            explanation TEXT DEFAULT '',
+            status TEXT DEFAULT 'open',
+            detected_at TEXT DEFAULT CURRENT_TIMESTAMP,
+            resolved_at TEXT,
+            FOREIGN KEY (project_id) REFERENCES projects(id) ON DELETE CASCADE,
+            FOREIGN KEY (memory_id_a) REFERENCES memories(id) ON DELETE CASCADE,
+            FOREIGN KEY (memory_id_b) REFERENCES memories(id) ON DELETE CASCADE,
+            UNIQUE(memory_id_a, memory_id_b, claim_subject, claim_predicate)
+        );
+        CREATE INDEX IF NOT EXISTS idx_conflicts_project_status
+            ON memory_conflicts(project_id, status, severity DESC);
+
+        CREATE TABLE IF NOT EXISTS grounded_answers (
+            id TEXT PRIMARY KEY,
+            project_id TEXT NOT NULL,
+            question TEXT NOT NULL,
+            answer TEXT NOT NULL,
+            policy TEXT NOT NULL DEFAULT 'strict',
+            status TEXT NOT NULL,
+            confidence REAL DEFAULT 0.0,
+            citation_coverage REAL DEFAULT 0.0,
+            verification TEXT DEFAULT '{}',
+            created_at TEXT DEFAULT CURRENT_TIMESTAMP,
+            FOREIGN KEY (project_id) REFERENCES projects(id) ON DELETE CASCADE
+        );
+        CREATE INDEX IF NOT EXISTS idx_grounded_answers_project
+            ON grounded_answers(project_id, created_at DESC);
+
+        CREATE TABLE IF NOT EXISTS answer_claims (
+            id TEXT PRIMARY KEY,
+            answer_id TEXT NOT NULL,
+            sentence_index INTEGER NOT NULL,
+            claim_text TEXT NOT NULL,
+            factual INTEGER NOT NULL DEFAULT 1,
+            support_status TEXT NOT NULL DEFAULT 'unchecked',
+            support_score REAL DEFAULT 0.0,
+            contradiction_score REAL DEFAULT 0.0,
+            verification_reason TEXT DEFAULT '',
+            created_at TEXT DEFAULT CURRENT_TIMESTAMP,
+            FOREIGN KEY (answer_id) REFERENCES grounded_answers(id) ON DELETE CASCADE
+        );
+        CREATE INDEX IF NOT EXISTS idx_answer_claims_answer ON answer_claims(answer_id);
+
+        CREATE TABLE IF NOT EXISTS answer_citations (
+            id TEXT PRIMARY KEY,
+            claim_id TEXT NOT NULL,
+            evidence_id TEXT NOT NULL,
+            citation_label TEXT DEFAULT '',
+            created_at TEXT DEFAULT CURRENT_TIMESTAMP,
+            FOREIGN KEY (claim_id) REFERENCES answer_claims(id) ON DELETE CASCADE,
+            FOREIGN KEY (evidence_id) REFERENCES evidence_spans(id) ON DELETE CASCADE,
+            UNIQUE(claim_id, evidence_id)
+        );
+        CREATE INDEX IF NOT EXISTS idx_answer_citations_claim ON answer_citations(claim_id);
+
+        CREATE TABLE IF NOT EXISTS hallucination_evaluations (
+            id TEXT PRIMARY KEY,
+            project_id TEXT NOT NULL,
+            name TEXT NOT NULL,
+            metrics TEXT NOT NULL DEFAULT '{}',
+            cases TEXT NOT NULL DEFAULT '[]',
+            created_at TEXT DEFAULT CURRENT_TIMESTAMP,
+            FOREIGN KEY (project_id) REFERENCES projects(id) ON DELETE CASCADE
+        );
+        CREATE INDEX IF NOT EXISTS idx_hallucination_eval_project
+            ON hallucination_evaluations(project_id, created_at DESC);
+
         CREATE TRIGGER IF NOT EXISTS trg_project_revision_create
         AFTER INSERT ON projects
         BEGIN
@@ -964,6 +1096,13 @@ class MemoryDB:
         version: str = "1",
         source: str = "custom",
     ) -> dict:
+        existing = self.conn.execute(
+            "SELECT source FROM memory_profiles WHERE profile_id=?", (profile_id,)
+        ).fetchone()
+        if existing and existing["source"] == "built-in" and source != "built-in":
+            raise ValueError(
+                f"Built-in memory profile '{profile_id}' cannot be overwritten."
+            )
         profile = normalize_profile_payload(
             profile_id=profile_id,
             traits=traits,
@@ -1029,6 +1168,24 @@ class MemoryDB:
             version=profile["version"],
             source="composed",
         )
+
+    def delete_memory_profile(self, profile_id: str) -> dict | None:
+        profile = self.get_memory_profile(profile_id)
+        if not profile:
+            return None
+        row = self.conn.execute(
+            "SELECT source FROM memory_profiles WHERE profile_id=?", (profile_id,)
+        ).fetchone()
+        if row and row["source"] == "built-in":
+            return {"protected": True, "profile": profile}
+        now = _now()
+        self.conn.execute(
+            "UPDATE projects SET profile_id=NULL, updated_at=? WHERE profile_id=?",
+            (now, profile_id),
+        )
+        self.conn.execute("DELETE FROM memory_profiles WHERE profile_id=?", (profile_id,))
+        self.conn.commit()
+        return {"deleted": True, "profile": profile}
 
     def set_project_profile(self, project_id: str, profile_id: str | None) -> dict | None:
         if profile_id and not self.get_memory_profile(profile_id):
@@ -1368,10 +1525,17 @@ class MemoryDB:
         return [dict(r) for r in rows]
 
     def record_memory_hit(self, mid: str) -> None:
+        self.record_memory_hits([mid])
+
+    def record_memory_hits(self, memory_ids: list[str]) -> None:
+        """Increment a retrieval result set in one transaction."""
+        ids = list(dict.fromkeys(str(mid) for mid in memory_ids if str(mid).strip()))
+        if not ids:
+            return
         now = _now()
-        self.conn.execute(
+        self.conn.executemany(
             "UPDATE memories SET hit_count = hit_count + 1, last_hit_at = ? WHERE id = ?",
-            (now, mid),
+            [(now, mid) for mid in ids],
         )
         self.conn.commit()
 

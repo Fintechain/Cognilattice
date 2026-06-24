@@ -85,6 +85,29 @@ score = importance * 0.30
 
 Strong candidates are accepted automatically. Uncertain candidates remain available for review instead of being silently promoted to durable truth.
 
+### Memory Steelprint
+
+Memory Steelprint turns provenance into an enforceable trust chain:
+
+```text
+original source + content hash
+  -> exact page / paragraph / line evidence span
+  -> memory claim and immutable steelprint hash
+  -> answer sentence citation
+  -> post-answer verification and refusal policy
+```
+
+It adds:
+
+- Exact source provenance with URI, version, content hash, page, paragraph, line, character range, section, and locator metadata.
+- Memory claims bound to one or more evidence spans.
+- Automatic conflict detection for incompatible claims about the same subject and predicate.
+- Answer-level citations where every factual sentence must be represented in the claim map.
+- `strict`, `balanced`, and `permissive` grounding policies. Strict mode refuses uncited, weakly supported, contradicted, or conflicted answers.
+- Persistent post-answer verification records and reproducible hallucination evaluations.
+
+The built-in verifier is deterministic and local. It checks citation existence, lexical grounding, source trust, polarity contradictions, open memory conflicts, citation coverage, and aggregate confidence. Applications may later add an NLI model or external verifier without changing the provenance schema.
+
 ### Personality-to-Profession Profiles
 
 Memery can bind a context to a memory profile before ingestion starts. The setup is two-step:
@@ -94,9 +117,31 @@ Memery can bind a context to a memory profile before ingestion starts. The setup
 
 The selected personality and profession are composed into one runtime memory profile. This means the practical tendency space is much larger than a single label: the system generates a composed prompt scaffold from the selected personality and profession rather than relying on one static template.
 
-Built-in profiles include `generalist_v1`, `software_engineer_v1`, `research_scientist_v1`, and `clinical_reasoner_v1`, but the setup flow now starts from a wider preset space: 36 personality presets and 72 profession presets. The profession scaffold follows the structure used by occupation resources such as O*NET, SOC, and ESCO: professional identity, objects, methods, evaluation criteria, case memory, and error memory. Profile-aware ingestion stores `base_score`, `store_score`, `memory_layer`, `trait_features`, `profession_features`, and `score_reason` so later curation can explain why a memory was kept. Memories are routed into `semantic`, `episodic`, `procedural`, or `error` layers.
+Built-in profiles include `generalist_v1`, `software_engineer_v1`, `research_scientist_v1`, and `clinical_reasoner_v1`, but the setup flow now starts from a wider preset space: 36 personality presets and 216 profession presets. The profession scaffold follows the structure used by occupation resources such as O*NET, SOC, and ESCO: professional identity, objects, methods, evaluation criteria, case memory, and error memory. Profile-aware ingestion stores `base_score`, `store_score`, `memory_layer`, `trait_features`, `profession_features`, and `score_reason` so later curation can explain why a memory was kept. Memories are routed into `semantic`, `episodic`, `procedural`, or `error` layers.
 
 Task feedback can be written with `record_memory_feedback`. Successful memories are lightly reinforced; ineffective or harmful memories are down-weighted, and harmful memories are quarantined for later correction.
+
+Custom profiles can be created directly from preset ids:
+
+```json
+{
+  "tool": "create_memory_profile",
+  "arguments": {
+    "profile_id": "rigorous_stats_v1",
+    "personality_id": "rigorous_validator_v1",
+    "profession_id": "statistician_v1",
+    "overrides": {
+      "calibration": {
+        "store_threshold": 0.82
+      }
+    }
+  }
+}
+```
+
+`calibration` is numeric scoring configuration, not prose instructions. Useful keys include `trait_weight`, `profession_weight`, `learning_weight`, `risk_penalty_weight`, `store_threshold`, and `retrieve_threshold`. JSON parsing errors report the exact field, for example `Invalid JSON in field 'calibration': ...`.
+
+Preset listing tools default to compact paginated output. Use `list_profession_presets(id="statistician_v1")` for one preset, `offset` and `limit` for pages, `fields` for field filtering, and `compact=false` only when the full prompt scaffold is needed.
 
 ### Self-Maintaining Top-Level Context
 
@@ -213,18 +258,75 @@ python -m memory_server
 
 ### MCP Client Configuration
 
-A typical local MCP configuration looks like this:
+Memery supports two MCP deployment modes.
+
+#### Mode A: client-started stdio
+
+The MCP client starts one private Memery process and owns its lifecycle:
 
 ```json
 {
   "mcpServers": {
     "memery": {
-      "command": "/absolute/path/to/python",
-      "args": ["-m", "memory_server"]
+      "command": "E:\\Python310\\python.exe",
+      "args": ["A:\\memery\\memory_server\\run_server.py"]
     }
   }
 }
 ```
+
+This mode is convenient for one MCP client. It cannot start while the shared singleton below is already running.
+
+#### Mode B: shared singleton over Streamable HTTP
+
+Start the service once, manually or through the operating system:
+
+```powershell
+E:\Python310\python.exe A:\memery\memory_server\run_server.py
+```
+
+The source helper above starts stdio, so for the shared service install the package first:
+
+```powershell
+E:\Python310\python.exe -m pip install -e A:\memery\memory_server
+E:\Python310\python.exe -m memory_server serve --host 127.0.0.1 --port 8765
+```
+
+Or use the installed console command:
+
+```powershell
+memery serve --host 127.0.0.1 --port 8765
+```
+
+The shared endpoints are:
+
+```text
+MCP:    http://127.0.0.1:8765/mcp
+Health: http://127.0.0.1:8765/health
+```
+
+Configure URL-capable clients to connect without starting another process:
+
+```json
+{
+  "mcpServers": {
+    "memery": {
+      "url": "http://127.0.0.1:8765/mcp"
+    }
+  }
+}
+```
+
+Multiple clients may connect to this HTTP singleton. The lock file records its mode and endpoint, so an accidental stdio launch reports the URL that should be used.
+
+### Input compatibility and failure behavior
+
+- Structured MCP fields accept native JSON arrays/objects as well as JSON-encoded strings where older clients require strings.
+- List limits are bounded, malformed numeric scores fall back safely with warnings, and non-finite values are rejected.
+- A missing named project, wing, or room returns an error instead of silently widening the query to all data.
+- Durable SQLite writes/deletes remain successful when the secondary vector index is temporarily unavailable; the response includes a warning.
+- The core temporal graph falls back to SQLite when the optional MemPalace integration is not installed.
+- Invalid evidence ranges, malformed claim maps, bad JSON, and unsupported enum values return structured errors instead of uncaught exceptions.
 
 Use the Python executable from the environment where Memery was installed:
 
@@ -240,6 +342,14 @@ Install Memery into the same Python environment used by the MCP client. If your 
 Use `memery profiles` to list built-in and custom personality/profession
 profiles, and `memery setup-status` to inspect whether the default profile has
 been configured.
+
+Only one Memery/Cognilattice server process should run on a machine at a time.
+That process may be either a private stdio instance or the shared HTTP singleton.
+Startup now takes an OS-level lock at `~/.memery/cache/memery-service.lock`
+by default and exits with a clear error if another instance is already
+running. HTTP mode permits multiple clients because they share the same process.
+Override the lock path only for isolated tests with
+`MEMERY_SERVICE_LOCK_PATH`.
 
 ### Troubleshooting Installation
 
@@ -360,10 +470,11 @@ For repeated individual writes, pass `refresh_summary=false`, then call `refresh
 | Area | Tools |
 |---|---|
 | Context | `create_context`, `create_project`, `wake_up`, `get_top_level_memory`, `get_context_bundle` |
-| Profiles | `get_setup_status`, `configure_memory_defaults`, `list_memory_profiles`, `get_memory_profile`, `create_memory_profile`, `set_project_profile`, `record_memory_feedback`, `list_memory_feedback` |
+| Profiles | `get_setup_status`, `configure_memory_defaults`, `list_memory_profiles`, `list_personality_presets`, `list_profession_presets`, `get_memory_profile`, `create_memory_profile`, `delete_memory_profile`, `set_project_profile`, `record_memory_feedback`, `list_memory_feedback` |
 | Ingestion | `ingest_update`, `ingest_conversation`, `extract_memory_candidates`, `review_memory_candidate` |
 | Memory | `write_memory`, `write_memories_batch`, `search_memory`, `recall_for_task`, `list_memories` |
 | Curation | `refresh_project_summary`, `update_latest_conversation_summary`, `compact_project_memory`, `prune_low_value_memories` |
+| Memory Steelprint | `register_provenance_source`, `add_evidence_span`, `steelprint_memory`, `get_memory_steelprint`, `detect_memory_conflicts`, `list_memory_conflicts`, `resolve_memory_conflict`, `verify_grounded_answer`, `run_hallucination_evaluation`, `list_hallucination_evaluations` |
 | Progress | `record_task_snapshot`, `record_decision`, `list_task_snapshots`, `list_decisions` |
 | Code graph | `analyze_project_code`, `get_graph_neighbors`, `query_graph_path`, `get_graph_stats` |
 | Knowledge graph | `add_knowledge_triple`, `query_entity`, `query_entity_timeline`, `invalidate_triple` |
@@ -386,7 +497,7 @@ SQLite remains a single-writer database. Very high concurrent write ratios will 
 
 ## Benchmarks
 
-The following measurements were produced locally on Windows with Python 3.10 in June 2026. They are implementation benchmarks, not universal hardware claims. Results vary with CPU, storage, Python build, database size, and workload.
+The following measurements were produced locally on Windows with Python 3.10 on June 24, 2026. They are implementation benchmarks, not universal hardware claims. Results vary with CPU, storage, Python build, database size, and workload.
 
 ### Combined Stress Run
 
@@ -409,12 +520,22 @@ python benchmarks\benchmark_stress.py `
 
 | Workload | Throughput | P50 | P95 | P99 | Errors |
 |---|---:|---:|---:|---:|---:|
-| Batch SQLite insert, 30,000 memories | 16,792.6 ops/s | 54.35 ms/batch | 79.80 ms/batch | 86.47 ms/batch | 0 |
-| Unchanged summary refresh, 1,000 calls | 46,989.2 ops/s | 0.018 ms | 0.029 ms | 0.041 ms | 0 |
-| Cached top-level read, 100,000 calls | 79,402.0 ops/s | 0.010 ms | 0.017 ms | 0.027 ms | 0 |
-| Mixed SQLite workload, 128 workers, 10% writes | 511.0 ops/s | 259.82 ms | 382.01 ms | 1,246.79 ms | 0 |
-| Real vector batch insert, 10,000 vectors | 13,318.9 ops/s | - | - | - | 0 |
-| Real vector search over 10,000 vectors | 48.2 searches/s | 20.52 ms | 23.96 ms | 26.38 ms | 0 |
+| Batch SQLite insert, 30,000 memories | 8,797.9 ops/s | 106.934 ms/batch | 144.193 ms/batch | 144.884 ms/batch | 0 |
+| Unchanged summary refresh, 1,000 calls | 36,029.0 ops/s | 0.025 ms | 0.039 ms | 0.113 ms | 0 |
+| Cached top-level read, 100,000 calls | 51,096.8 ops/s | 0.015 ms | 0.029 ms | 0.111 ms | 0 |
+| Mixed SQLite workload, 128 workers, 10% writes | 294.4 ops/s | 314.636 ms | 868.078 ms | 2,014.869 ms | 0 |
+| Real vector batch insert, 10,000 vectors | 2,768.2 ops/s | - | - | - | 0 |
+| Real vector search over 10,000 vectors | 38.1 searches/s | 25.572 ms | 30.956 ms | 43.799 ms | 0 |
+
+### Shared HTTP MCP Stress Run
+
+The Streamable HTTP singleton was also exercised with 32 simultaneous MCP clients. Each client initialized a session and executed 100 operations with 10% writes, 10% service-status reads, and 80% memory searches.
+
+| Workload | Throughput | P50 | P95 | P99 | Errors |
+|---|---:|---:|---:|---:|---:|
+| 3,200 MCP tool calls, 32 clients | 32.1 ops/s | 846.287 ms | 1,710.926 ms | 2,251.979 ms | 0 |
+
+All 62 exposed MCP tools were additionally invoked through a real Streamable HTTP session with valid minimum arguments; no protocol-level tool execution errors occurred.
 
 ### Optimization Progress
 
@@ -442,7 +563,7 @@ Remove-Item Env:PYTEST_DISABLE_PLUGIN_AUTOLOAD
 Current result:
 
 ```text
-10 passed
+55 passed
 ```
 
 Run a smaller core-only benchmark:
@@ -520,6 +641,7 @@ pyproject.toml             Packaging, dependencies, and console command
 - SQLite has one writer; batch ingestion is strongly preferred under heavy write load.
 - The default TF-IDF vectors are lightweight and local, but they are not a replacement for a strong multilingual embedding model in every domain.
 - Summary extraction is deterministic and heuristic. It avoids API dependencies, but it may require explicit task snapshots or decisions for the best results.
+- Memory Steelprint's default entailment check is lexical and polarity-based. High-stakes deployments should add a domain-specific NLI or human review layer.
 - Graphify and MemPalace are external dependencies whose behavior can change between releases.
 - Automatic ANN indexing is intentionally disabled until the installed LanceDB index builder proves stable under the included stress suite.
 

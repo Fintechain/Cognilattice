@@ -588,14 +588,18 @@ class MemoryCurator:
             return self.palace.add_knowledge_triple(
                 subject, predicate, obj, valid_from=valid_from, valid_to=valid_to,
                 confidence=confidence, drawer_ref=drawer_ref)
-        except RuntimeError as exc:
-            return {"error": str(exc)}
+        except RuntimeError:
+            return self.db.add_triple(
+                subject, predicate, obj, valid_from=valid_from, valid_to=valid_to,
+                confidence_score=confidence, drawer_ref=drawer_ref,
+            )
 
     def query_entity(self, entity: str, as_of: str | None = None) -> dict:
         try:
             return self.palace.query_knowledge(entity, as_of=as_of)
-        except RuntimeError as exc:
-            return {"error": str(exc)}
+        except RuntimeError:
+            results = self.db.query_entity(entity, as_of=as_of)
+            return {"entity": entity, "count": len(results), "results": results}
 
     # ── Dedup / Merge / Compact / Prune ──────────────────────────────────
 

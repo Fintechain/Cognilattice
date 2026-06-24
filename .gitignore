@@ -28,6 +28,8 @@ memory.db-wal
 lancedb_data/
 memery_data/
 cache/
+.runtime/
+.git-write/
 
 # Local configuration and secrets
 .env

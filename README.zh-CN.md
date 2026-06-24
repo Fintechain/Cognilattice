@@ -84,6 +84,28 @@ score = importance * 0.30
 
 画像感知写入会保存 `base_score`、`store_score`、`memory_layer`、`trait_features`、`profession_features` 和 `score_reason`，使之后的策展过程能够解释为什么某条记忆被保留。记忆会被路由到 `semantic`、`episodic`、`procedural` 或 `error` 层。
 
+可以直接用预设 id 创建自定义画像：
+
+```json
+{
+  "tool": "create_memory_profile",
+  "arguments": {
+    "profile_id": "rigorous_stats_v1",
+    "personality_id": "rigorous_validator_v1",
+    "profession_id": "statistician_v1",
+    "overrides": {
+      "calibration": {
+        "store_threshold": 0.82
+      }
+    }
+  }
+}
+```
+
+`calibration` 是数值评分配置，不是行为准则散文。常用键包括 `trait_weight`、`profession_weight`、`learning_weight`、`risk_penalty_weight`、`store_threshold` 和 `retrieve_threshold`。如果 JSON 解析失败，错误会指出具体字段，例如 `Invalid JSON in field 'calibration': ...`。
+
+预设列表工具默认使用紧凑分页输出。用 `list_profession_presets(id="statistician_v1")` 获取单条预设，用 `offset` 和 `limit` 翻页，用 `fields` 过滤字段，只有确实需要完整 prompt scaffold 时才传 `compact=false`。
+
 ## 存储与检索
 
 - SQLite WAL 保存项目、记忆、候选、任务、决策、边和时序三元组。
@@ -170,6 +192,8 @@ memery configure --profile software_engineer_v1 --yes
 
 也可以在安装后使用 `memery` 作为 MCP stdio server。面向人类的健康检查请使用 `memery doctor`。
 
+同一台机器一次只能运行一个 Memery/Cognilattice MCP 服务。服务启动时会默认在 `~/.memery/cache/memery-service.lock` 获取 OS 级独占锁；如果已有实例在运行，第二个实例会直接退出并给出明确错误。只有在隔离测试场景下才建议用 `MEMERY_SERVICE_LOCK_PATH` 覆盖锁路径。
+
 ## 基础使用
 
 创建上下文：
@@ -251,7 +275,7 @@ memery configure --profile software_engineer_v1 --yes
 | 领域 | 工具 |
 |---|---|
 | 上下文 | `create_context`, `create_project`, `wake_up`, `get_top_level_memory`, `get_context_bundle` |
-| 画像 | `get_setup_status`, `configure_memory_defaults`, `list_memory_profiles`, `get_memory_profile`, `create_memory_profile`, `set_project_profile`, `record_memory_feedback`, `list_memory_feedback` |
+| 画像 | `get_setup_status`, `configure_memory_defaults`, `list_memory_profiles`, `list_personality_presets`, `list_profession_presets`, `get_memory_profile`, `create_memory_profile`, `delete_memory_profile`, `set_project_profile`, `record_memory_feedback`, `list_memory_feedback` |
 | 写入 | `ingest_update`, `ingest_conversation`, `extract_memory_candidates`, `review_memory_candidate` |
 | 记忆 | `write_memory`, `write_memories_batch`, `search_memory`, `recall_for_task`, `list_memories` |
 | 策展 | `refresh_project_summary`, `update_latest_conversation_summary`, `compact_project_memory`, `prune_low_value_memories` |

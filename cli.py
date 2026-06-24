@@ -300,6 +300,23 @@ def main(argv: list[str] | None = None) -> int | None:
     )
     subparsers = parser.add_subparsers(dest="command")
     subparsers.add_parser("doctor", help="check the local Memery installation")
+    serve = subparsers.add_parser(
+        "serve",
+        help="run one shared Streamable HTTP MCP service",
+    )
+    serve.add_argument("--host", default="127.0.0.1")
+    serve.add_argument("--port", type=int, default=8765)
+    serve.add_argument("--path", default="/mcp")
+    serve.add_argument(
+        "--json-response",
+        action="store_true",
+        help="return JSON responses instead of opening SSE streams where possible",
+    )
+    serve.add_argument(
+        "--stateless-http",
+        action="store_true",
+        help="create an independent MCP transport for each HTTP request",
+    )
     subparsers.add_parser("profiles", help="list available personality/profession profiles")
     subparsers.add_parser("setup-status", help="print first-run profile setup status")
     configure = subparsers.add_parser(
@@ -335,6 +352,17 @@ def main(argv: list[str] | None = None) -> int | None:
 
     if args.command == "doctor":
         return _doctor()
+    if args.command == "serve":
+        from .server import main as server_main
+        server_main(
+            transport="streamable-http",
+            host=args.host,
+            port=args.port,
+            path=args.path,
+            json_response=args.json_response,
+            stateless_http=args.stateless_http,
+        )
+        return None
     if args.command == "profiles":
         return _print_profiles()
     if args.command == "setup-status":

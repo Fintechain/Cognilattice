@@ -142,6 +142,10 @@ def test_compaction_promotes_profile_memories(tmp_path):
 
 
 def test_server_feedback_generates_error_memory(tmp_path, monkeypatch):
+    monkeypatch.setenv("MEMERY_DB_PATH", str(tmp_path / "import-memory.db"))
+    monkeypatch.setenv("MEMERY_DATA_DIR", str(tmp_path / "import-data"))
+    import memory_server.config as config_module
+    monkeypatch.setattr(config_module, "_config", None)
     import memory_server.server as server
 
     db = MemoryDB(str(tmp_path / "memory.db"))

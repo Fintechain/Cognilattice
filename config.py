@@ -158,7 +158,17 @@ class MemeryConfig:
         """Load config from env vars, then file, then defaults."""
         cfg = cls()
 
-        # Env overrides
+        # File overrides
+        if CONFIG_FILE.exists():
+            try:
+                file_cfg = json.loads(CONFIG_FILE.read_text(encoding="utf-8"))
+                for key, val in file_cfg.items():
+                    if hasattr(cfg, key):
+                        setattr(cfg, key, val)
+            except (json.JSONDecodeError, OSError):
+                pass
+
+        # Env overrides have final priority over config file values.
         if os.environ.get("MEMERY_DATA_DIR"):
             cfg.data_dir = os.environ["MEMERY_DATA_DIR"]
         if os.environ.get("MEMERY_DB_PATH"):
@@ -181,16 +191,6 @@ class MemeryConfig:
             cfg.profile_setup_configured = os.environ[
                 "MEMERY_PROFILE_SETUP_CONFIGURED"
             ].lower() in {"1", "true", "yes", "on"}
-
-        # File overrides
-        if CONFIG_FILE.exists():
-            try:
-                file_cfg = json.loads(CONFIG_FILE.read_text(encoding="utf-8"))
-                for key, val in file_cfg.items():
-                    if hasattr(cfg, key):
-                        setattr(cfg, key, val)
-            except (json.JSONDecodeError, OSError):
-                pass
 
         return cfg
 

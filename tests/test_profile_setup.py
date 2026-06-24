@@ -50,6 +50,33 @@ def test_profile_setup_persists_default_profile(monkeypatch, tmp_path):
     assert loaded.setup_required() is False
 
 
+def test_environment_overrides_config_file(monkeypatch, tmp_path):
+    import memory_server.config as config_module
+
+    config_dir = tmp_path / "home" / ".memery"
+    config_dir.mkdir(parents=True)
+    config_file = config_dir / "config.json"
+    config_file.write_text(
+        json.dumps({
+            "db_path": str(tmp_path / "file.db"),
+            "data_dir": str(tmp_path / "file-data"),
+            "default_profile_id": "generalist_v1",
+        }),
+        encoding="utf-8",
+    )
+    monkeypatch.setattr(config_module, "CONFIG_DIR", config_dir)
+    monkeypatch.setattr(config_module, "CONFIG_FILE", config_file)
+    monkeypatch.setenv("MEMERY_DB_PATH", str(tmp_path / "env.db"))
+    monkeypatch.setenv("MEMERY_DATA_DIR", str(tmp_path / "env-data"))
+    monkeypatch.setenv("MEMERY_DEFAULT_PROFILE_ID", "software_engineer_v1")
+
+    loaded = MemeryConfig.from_env()
+
+    assert loaded.db_path == str(tmp_path / "env.db")
+    assert loaded.data_dir == str(tmp_path / "env-data")
+    assert loaded.default_profile_id == "software_engineer_v1"
+
+
 def test_personality_profession_presets_compose_profile(tmp_path):
     db = MemoryDB(str(tmp_path / "memory.db"))
 
@@ -108,9 +135,9 @@ def test_cli_configure_noninteractive_sets_default_profile(monkeypatch, tmp_path
 
 
 def test_server_setup_tools_configure_default(monkeypatch, tmp_path):
+    cfg = _isolate_config(monkeypatch, tmp_path)
     import memory_server.server as server
 
-    cfg = _isolate_config(monkeypatch, tmp_path)
     db = MemoryDB(str(tmp_path / "server-memory.db"))
     monkeypatch.setattr(server, "cfg", cfg)
     monkeypatch.setattr(server, "db", db)
@@ -130,4 +157,116 @@ def test_server_setup_tools_configure_default(monkeypatch, tmp_path):
     assert server.get_setup_status()["default_profile"]["profession"]["role"] == "clinical_reasoner"
     project = db.create_project("clinical-context")
     assert project["profile_id"] == "risk_sentinel__clinical_reasoner_v1"
+    db.close()
+
+
+def test_create_memory_profile_accepts_preset_ids_and_overrides(monkeypatch, tmp_path):
+    _isolate_config(monkeypatch, tmp_path)
+    import memory_server.server as server
+
+    db = MemoryDB(str(tmp_path / "server-memory.db"))
+    monkeypatch.setattr(server, "db", db)
+    monkeypatch.setattr(server.curator, "db", db)
+
+    created = server.create_memory_profile(
+        profile_id="rigorous_stats_probe_v1",
+        personality_id="rigorous_validator_v1",
+        profession_id="statistician_v1",
+        overrides={"calibration": {"store_threshold": 0.82}},
+    )
+
+    assert created["status"] == "saved"
+    profile = created["profile"]
+    assert profile["profile_id"] == "rigorous_stats_probe_v1"
+    assert profile["profession"]["role"] == "statistician"
+    assert profile["traits"]["rigor"] > 0.9
+    assert profile["calibration"]["store_threshold"] == 0.82
+    db.close()
+
+
+def test_create_memory_profile_reports_invalid_json_field(monkeypatch, tmp_path):
+    _isolate_config(monkeypatch, tmp_path)
+    import memory_server.server as server
+
+    db = MemoryDB(str(tmp_path / "server-memory.db"))
+    monkeypatch.setattr(server, "db", db)
+    monkeypatch.setattr(server.curator, "db", db)
+
+    result = server.create_memory_profile(
+        profile_id="bad_json_probe_v1",
+        traits={"rigor": 0.8},
+        profession={"role": "tester"},
+        calibration="not json",
+    )
+
+    assert result["error"].startswith("Invalid JSON in field 'calibration':")
+    db.close()
+
+
+def test_create_memory_profile_reports_invalid_override_field(monkeypatch, tmp_path):
+    _isolate_config(monkeypatch, tmp_path)
+    import memory_server.server as server
+
+    db = MemoryDB(str(tmp_path / "server-memory.db"))
+    monkeypatch.setattr(server, "db", db)
+    monkeypatch.setattr(server.curator, "db", db)
+
+    result = server.create_memory_profile(
+        profile_id="bad_override_probe_v1",
+        personality_id="rigorous_validator_v1",
+        profession_id="statistician_v1",
+        overrides={"calibration": "store threshold should be high"},
+    )
+
+    assert result["error"] == (
+        "Invalid JSON in field 'overrides.calibration': expected an object, got str."
+    )
+    db.close()
+
+
+def test_preset_lists_are_compact_pageable_and_addressable(monkeypatch, tmp_path):
+    _isolate_config(monkeypatch, tmp_path)
+    import memory_server.server as server
+
+    db = MemoryDB(str(tmp_path / "server-memory.db"))
+    monkeypatch.setattr(server, "db", db)
+    monkeypatch.setattr(server.curator, "db", db)
+
+    page = server.list_profession_presets(offset=0, limit=3)
+    assert page["count"] == 3
+    assert page["total"] == 216
+    assert page["has_more"] is True
+    assert "profession_prompt" not in page["professions"][0]
+
+    single = server.list_profession_presets(id="statistician_v1")
+    assert single["profession"]["profession_id"] == "statistician_v1"
+    assert single["profession"]["role"] == "statistician"
+
+    status = server.get_setup_status()
+    assert status["available_counts"]["professions"] == 216
+    assert status["available_professions_truncated"] is True
+    assert len(status["available_professions"]) == 50
+    db.close()
+
+
+def test_delete_memory_profile_removes_custom_but_protects_builtin(monkeypatch, tmp_path):
+    _isolate_config(monkeypatch, tmp_path)
+    import memory_server.server as server
+
+    db = MemoryDB(str(tmp_path / "server-memory.db"))
+    monkeypatch.setattr(server, "db", db)
+    monkeypatch.setattr(server.curator, "db", db)
+    db.compose_memory_profile(
+        "risk_sentinel_v1",
+        "software_engineer_v1",
+        profile_id="probe_tmp_v1",
+    )
+
+    deleted = server.delete_memory_profile("probe_tmp_v1")
+    assert deleted == {"status": "deleted", "profile_id": "probe_tmp_v1"}
+    assert db.get_memory_profile("probe_tmp_v1") is None
+
+    protected = server.delete_memory_profile("generalist_v1")
+    assert "cannot be deleted" in protected["error"]
+    assert db.get_memory_profile("generalist_v1") is not None
     db.close()
