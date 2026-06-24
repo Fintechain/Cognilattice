@@ -48,7 +48,7 @@ flowchart TD
     C --> D{"高置信度？"}
     D -->|是| E["写入或合并长期记忆"]
     D -->|否| F["保留为候选记忆"]
-    E --> G["SQLite WAL 存储"]
+    E --> G["SQLite 存储"]
     E --> H["LanceDB 语义索引"]
     E --> I["时序知识图谱"]
     G --> J["修订感知策展器"]
@@ -108,8 +108,8 @@ score = importance * 0.30
 
 ## 存储与检索
 
-- SQLite WAL 保存项目、记忆、候选、任务、决策、边和时序三元组。
-- 每个工作线程使用独立 SQLite 连接，支持并发读取和受控写入竞争。
+- SQLite 线程本地连接保存项目、记忆、候选、任务、决策、边和时序三元组。
+- 每个工作线程使用独立 SQLite 连接，支持并发读取和受控写入竞争。日志模式为 `DELETE`，确保在 Windows、macOS 和 Linux 本地文件系统上可靠运行。
 - LanceDB 保存本地语义向量。
 - 默认使用字符 n-gram TF-IDF，做到无 API key 的本地嵌入。
 - 向量搜索先按项目过滤，避免跨项目污染。
@@ -286,7 +286,7 @@ memery configure --profile software_engineer_v1 --yes
 ## 性能设计
 
 - 线程本地 SQLite 连接避免跨线程连接错误。
-- 启用 WAL、`synchronous=NORMAL`、内存临时存储、32 MiB page cache 和 mmap。
+- 启用 `synchronous=NORMAL`、内存临时存储、32 MiB page cache 和 mmap。
 - 项目、状态、类型、分数和更新时间都有组合索引。
 - 批量写入最多可在一个事务中写入 5,000 条记忆。
 - 摘要来源限制在 120 条高价值或近期记忆。
@@ -327,7 +327,7 @@ python benchmarks\benchmark_stress.py `
 | 真实向量批量插入，10,000 条 | 13,318.9 ops/s | - | - | - | 0 |
 | 10,000 向量上的真实搜索 | 48.2 searches/s | 20.52 ms | 23.96 ms | 26.38 ms | 0 |
 
-优化前，初始实现使用共享 SQLite 连接，在 16 线程混合测试中 1,000 次操作全部失败。引入线程本地连接、WAL 调优、有界摘要、修订感知缓存和查询重构后，压力测试达到零错误。
+优化前，初始实现使用共享 SQLite 连接，在 16 线程混合测试中 1,000 次操作全部失败。引入线程本地连接、日志调优、有界摘要、修订感知缓存和查询重构后，压力测试达到零错误。
 
 同一 20,000 条记忆负载下的改进：
 
@@ -365,19 +365,27 @@ python benchmarks\benchmark_stress.py `
 
 配置加载顺序：
 
-1. 环境变量。
+1. 环境变量（最高优先级）。
 2. `~/.memery/config.json`。
 3. 内置默认值。
 
+环境变量：
+
 | 变量 | 用途 |
 |---|---|
-| `MEMERY_DATA_DIR` | 数据目录 |
-| `MEMERY_DB_PATH` | SQLite 数据库路径 |
+| `MEMERY_DATA_DIR` | 数据目录（默认：`~/.memery/data`） |
+| `MEMERY_DB_PATH` | SQLite 数据库路径（默认：`~/.memery/memory.db`） |
 | `MEMERY_VECTOR_BACKEND` | 向量后端，目前为 `lancedb` |
 | `MEMERY_EMBEDDING_DIM` | 嵌入维度 |
 | `MEMERY_PALACE_VECTOR_ENABLED` | 启用可选 MemPalace/Chroma 二级向量写入路径 |
 
-默认本地路径：
+默认画像（人格+职业）保存在 `~/.memery/config.json`。
+
+## 数据布局
+
+用户数据位于 `~/.memery/`，**绝不**提交到仓库。`.gitignore` 规则会屏蔽 `data/`、`*.db`、`*.sqlite`、`*.pkl` 和运行时产物作为安全网。
+
+`~/.memery/` 下的默认路径：
 
 ```text
 ~/.memery/memory.db
@@ -387,7 +395,7 @@ python benchmarks\benchmark_stress.py `
 ~/.memery/config.json
 ```
 
-备份时请备份完整的 `~/.memery` 目录。
+备份时请备份完整的 `~/.memery` 目录。开发时可设置 `MEMERY_DB_PATH` 和 `MEMERY_DATA_DIR` 指向项目本地的 `data/` 目录。
 
 ## 仓库结构
 

@@ -58,7 +58,7 @@ flowchart TD
     C --> D{"High-confidence?"}
     D -->|Yes| E["Write or merge durable memory"]
     D -->|No| F["Keep candidate for review"]
-    E --> G["SQLite WAL store"]
+    E --> G["SQLite store"]
     E --> H["LanceDB semantic index"]
     E --> I["Temporal knowledge graph"]
     G --> J["Revision-aware curator"]
@@ -155,8 +155,8 @@ A project revision counter invalidates cached summaries only when relevant data 
 
 ### Storage and Retrieval
 
-- **SQLite in WAL mode** stores projects, memories, candidates, reviews, tasks, decisions, edges, and temporal triples.
-- **One SQLite connection per worker thread** permits concurrent reads and controlled write contention.
+- **SQLite with thread-local connections** stores projects, memories, candidates, reviews, tasks, decisions, edges, and temporal triples.
+- **One SQLite connection per worker thread** permits concurrent reads and controlled write contention. The journal is `DELETE` mode for reliable local filesystem operation across Windows, macOS, and Linux.
 - **LanceDB** stores lightweight local semantic vectors.
 - **Character n-gram TF-IDF embeddings** provide a zero-API-key default embedding path.
 - **Project-prefiltered vector search** prevents cross-project pollution and avoids unnecessary full-database retrieval.
@@ -279,22 +279,17 @@ This mode is convenient for one MCP client. It cannot start while the shared sin
 
 #### Mode B: shared singleton over Streamable HTTP
 
-Start the service once, manually or through the operating system:
+Start the shared service once, manually or through the operating system:
 
 ```powershell
-E:\Python310\python.exe A:\memery\memory_server\run_server.py
+memery serve --host 127.0.0.1 --port 8765
 ```
 
-The source helper above starts stdio, so for the shared service install the package first:
+For development with a project-local database (avoiding shared `~/.memery`):
 
 ```powershell
-E:\Python310\python.exe -m pip install -e A:\memery\memory_server
-E:\Python310\python.exe -m memory_server serve --host 127.0.0.1 --port 8765
-```
-
-Or use the installed console command:
-
-```powershell
+$env:MEMERY_DB_PATH = "A:\path\to\project\data\memory.db"
+$env:MEMERY_DATA_DIR = "A:\path\to\project\data"
 memery serve --host 127.0.0.1 --port 8765
 ```
 
@@ -484,7 +479,7 @@ For repeated individual writes, pass `refresh_summary=false`, then call `refresh
 The performance path is intentionally different from a naive "write one row, regenerate everything" design.
 
 - Thread-local SQLite connections avoid cross-thread connection failures.
-- WAL, `synchronous=NORMAL`, memory-backed temporary storage, a 32 MiB page cache, and memory mapping are enabled.
+- `synchronous=NORMAL`, memory-backed temporary storage, a 32 MiB page cache, and memory mapping are enabled.
 - Composite indexes cover project, status, type, score, and update time.
 - Batch writes use one transaction for as many as 5,000 memories.
 - Summary source selection is bounded to 120 high-value or recent memories.
@@ -539,7 +534,7 @@ All 62 exposed MCP tools were additionally invoked through a real Streamable HTT
 
 ### Optimization Progress
 
-The initial implementation used one shared SQLite connection and failed all 1,000 operations in a 16-thread mixed test. After thread-local connections, WAL tuning, bounded summaries, revision-aware caching, and query redesign, stress runs completed with zero errors.
+The initial implementation used one shared SQLite connection and failed all 1,000 operations in a 16-thread mixed test. After thread-local connections, journal tuning, bounded summaries, revision-aware caching, and query redesign, stress runs completed with zero errors.
 
 Notable improvements measured with the same 20,000-memory workload:
 
@@ -579,25 +574,27 @@ python benchmarks\benchmark_stress.py `
 
 Configuration is loaded in this order:
 
-1. Environment variables.
+1. Environment variables (highest priority).
 2. `~/.memery/config.json`.
 3. Built-in defaults.
 
-Useful variables:
+Useful environment variables:
 
 | Variable | Purpose |
 |---|---|
-| `MEMERY_DATA_DIR` | Memery data directory |
-| `MEMERY_DB_PATH` | SQLite database path |
+| `MEMERY_DATA_DIR` | Data directory (default: `~/.memery/data`) |
+| `MEMERY_DB_PATH` | SQLite database path (default: `~/.memery/memory.db`) |
 | `MEMERY_VECTOR_BACKEND` | Vector backend, currently `lancedb` |
 | `MEMERY_EMBEDDING_DIM` | Embedding dimension |
 | `MEMERY_PALACE_VECTOR_ENABLED` | Enable the optional MemPalace/Chroma secondary vector write path |
 
-The secondary MemPalace vector path is disabled by default because its Chroma/ONNX dependency chain can be unstable on some Windows installations. The primary SQLite and LanceDB paths remain fully functional.
+The default profile (personality + profession) is stored in `~/.memery/config.json`. The secondary MemPalace vector path is disabled by default because its Chroma/ONNX dependency chain can be unstable on some Windows installations. The primary SQLite and LanceDB paths remain fully functional.
 
 ## Data Layout
 
-Default local paths:
+User data lives in `~/.memery/` and is **never** committed to the repository. The `.gitignore` rules block `data/`, `*.db`, `*.sqlite`, `*.pkl`, and runtime artifacts as a safety net.
+
+Default paths under `~/.memery/`:
 
 ```text
 ~/.memery/memory.db                  SQLite memory and graph metadata
@@ -607,9 +604,14 @@ Default local paths:
 ~/.memery/config.json                User configuration
 ```
 
-Back up the complete `~/.memery` directory when preserving an installation.
+Override these paths with environment variables:
 
-Older source-tree installations may contain `memory.db`, `lancedb_data`, or `memery_data` inside the repository. These paths are now ignored by Git. Move the data into `~/.memery`, or keep using it explicitly through `MEMERY_DB_PATH` and `MEMERY_DATA_DIR`.
+| Variable | Purpose |
+|---|---|
+| `MEMERY_DATA_DIR` | Data directory (default: `~/.memery/data`) |
+| `MEMERY_DB_PATH` | SQLite database path (default: `~/.memery/memory.db`) |
+
+Back up the complete `~/.memery` directory when preserving an installation. For development, point `MEMERY_DB_PATH` and `MEMERY_DATA_DIR` to a project-local `data/` directory.
 
 ## Repository Layout
 
